@@ -65,7 +65,11 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    NavHost(navController = navController, startDestination = "home") {
+                    NavHost(navController = navController, startDestination = "welcome") {
+                        composable("welcome") {
+                            WelcomeScreen(navController)
+                        }
+
                         composable("home") {
                             HomeScreen(navController)
                         }
