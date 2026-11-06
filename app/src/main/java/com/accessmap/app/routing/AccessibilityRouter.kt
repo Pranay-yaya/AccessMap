@@ -3,18 +3,21 @@ package com.accessmap.app.routing
 import java.util.PriorityQueue
 
 data class RouteResult(
-    val path: List<String>,       // ordered node ids
-    val edges: List<CampusEdge>,  // edges traversed, in order
-    val totalCost: Double
+    val path: List<String>,
+    val edges: List<CampusEdge>,
+    val totalCost: Double,
+    val totalDistanceMeters: Double
 )
 
-/**
- * Dijkstra over accessibility-weighted edges. Returns null if no accessible
- * path exists between the two nodes (e.g. only stairs connect them).
- */
 class AccessibilityRouter(private val graph: CampusGraph) {
 
-    fun findAccessibleRoute(startId: String, endId: String): RouteResult? {
+    fun findAccessibleRoute(startId: String, endId: String): RouteResult? =
+        dijkstra(startId, endId, accessible = true)
+
+    fun findNormalRoute(startId: String, endId: String): RouteResult? =
+        dijkstra(startId, endId, accessible = false)
+
+    private fun dijkstra(startId: String, endId: String, accessible: Boolean): RouteResult? {
         val distances = mutableMapOf<String, Double>().withDefault { Double.POSITIVE_INFINITY }
         val previous = mutableMapOf<String, CampusEdge>()
         val visited = mutableSetOf<String>()
@@ -30,8 +33,8 @@ class AccessibilityRouter(private val graph: CampusGraph) {
             if (current == endId) break
 
             for (edge in graph.neighbors(current)) {
-                val edgeCost = edge.accessibilityCost()
-                if (edgeCost.isInfinite()) continue // blocked: stairs or non-accessible
+                val edgeCost = if (accessible) edge.accessibilityCost() else edge.normalCost()
+                if (edgeCost.isInfinite()) continue
 
                 val newDist = distances.getValue(current) + edgeCost
                 if (newDist < distances.getValue(edge.to)) {
@@ -42,9 +45,8 @@ class AccessibilityRouter(private val graph: CampusGraph) {
             }
         }
 
-        if (distances.getValue(endId).isInfinite()) return null // no accessible path found
+        if (distances.getValue(endId).isInfinite()) return null
 
-        // reconstruct path
         val path = mutableListOf(endId)
         val edgesUsed = mutableListOf<CampusEdge>()
         var cursor = endId
@@ -57,6 +59,7 @@ class AccessibilityRouter(private val graph: CampusGraph) {
         path.reverse()
         edgesUsed.reverse()
 
-        return RouteResult(path, edgesUsed, distances.getValue(endId))
+        val totalDist = edgesUsed.sumOf { it.distance }
+        return RouteResult(path, edgesUsed, distances.getValue(endId), totalDist)
     }
 }
