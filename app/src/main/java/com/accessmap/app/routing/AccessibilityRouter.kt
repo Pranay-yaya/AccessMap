@@ -27,7 +27,7 @@ class AccessibilityRouter(private val graph: CampusGraph) {
         queue.add(startId)
 
         while (queue.isNotEmpty()) {
-            val current = queue.poll()
+            val current = queue.poll() ?: break
             if (current in visited) continue
             visited.add(current)
             if (current == endId) break
