@@ -1,0 +1,28 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="42dp"
+    android:height="42dp"
+    android:viewportWidth="42"
+    android:viewportHeight="42">
+  <!-- Outer glow / drop shadow -->
+  <path
+      android:fillColor="#44000000"
+      android:pathData="M21,39 C25,39 28,36 21,36 C14,36 17,39 21,39 Z"/>
+  <!-- Vibrant Start Pin Body (Emerald Green) -->
+  <path
+      android:fillColor="#00C853"
+      android:pathData="M21,2 C12.72,2 6,8.72 6,17 C6,27.5 21,38 21,38 C21,38 36,27.5 36,17 C36,8.72 29.28,2 21,2 Z"/>
+  <!-- Dark green outline border -->
+  <path
+      android:strokeColor="#007E33"
+      android:strokeWidth="1.5"
+      android:pathData="M21,2 C12.72,2 6,8.72 6,17 C6,27.5 21,38 21,38 C21,38 36,27.5 36,17 C36,8.72 29.28,2 21,2 Z"/>
+  <!-- Inner White Circle -->
+  <path
+      android:fillColor="#FFFFFF"
+      android:pathData="M21,7 C15.48,7 11,11.48 11,17 C11,22.52 15.48,27 21,27 C26.52,27 31,22.52 31,17 C31,11.48 26.52,7 21,7 Z"/>
+  <!-- Green "S" / Start play icon inside -->
+  <path
+      android:fillColor="#00C853"
+      android:pathData="M18,12 L26,17 L18,22 Z"/>
+</vector>
+

@@ -37,14 +37,38 @@ import com.accessmap.app.routing.CampusNode
 import com.accessmap.app.routing.LPU_CAMPUS_NODES
 import com.accessmap.app.routing.LpuCampusData
 import com.accessmap.app.routing.RouteResult
+import androidx.compose.foundation.clickable
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
+import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 
 // LPU main campus center (Central Library / Administration area)
 val LPU_CENTER = GeoPoint(31.2525, 75.7038)
+
+// Google Maps Satellite Hybrid (Photographic aerial view + building/road labels)
+val GoogleSatelliteHybrid = object : OnlineTileSourceBase(
+    "GoogleHybrid",
+    0, 20, 256, ".jpg",
+    arrayOf(
+        "https://mt0.google.com/vt/lyrs=y",
+        "https://mt1.google.com/vt/lyrs=y",
+        "https://mt2.google.com/vt/lyrs=y",
+        "https://mt3.google.com/vt/lyrs=y"
+    ),
+    "© Google Maps Satellite"
+) {
+    override fun getTileURLString(pMapTileIndex: Long): String {
+        return baseUrl +
+                "&hl=en&x=" + MapTileIndex.getX(pMapTileIndex) +
+                "&y=" + MapTileIndex.getY(pMapTileIndex) +
+                "&z=" + MapTileIndex.getZoom(pMapTileIndex)
+    }
+}
 
 @Composable
 fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
@@ -59,6 +83,7 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
         } else null
     }
 
+    var isSatelliteView by remember { mutableStateOf(true) }
     var showRouteInfo by remember { mutableStateOf(routeResult != null) }
     var selectedNode by remember { mutableStateOf<CampusNode?>(null) }
 
@@ -66,7 +91,7 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
         AndroidView(
             factory = { ctx ->
                 MapView(ctx).apply {
-                    setTileSource(TileSourceFactory.MAPNIK)
+                    setTileSource(if (isSatelliteView) GoogleSatelliteHybrid else TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
                     controller.setZoom(17.5)
                     controller.setCenter(LPU_CENTER)
@@ -100,62 +125,158 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                         overlays.add(marker)
                     }
 
-                    // Draw route polyline if available
+                    // Draw colorful high-contrast route polyline and waypoint pins if available
                     routeResult?.let { result ->
                         val routePoints = result.path.mapNotNull { nodeId ->
                             graph.nodeById(nodeId)?.let { GeoPoint(it.latitude, it.longitude) }
                         }
                         if (routePoints.size >= 2) {
-                            val polyline = Polyline()
-                            polyline.setPoints(routePoints)
-                            polyline.outlinePaint.color = android.graphics.Color.parseColor("#1565C0")
-                            polyline.outlinePaint.strokeWidth = 14f
-                            polyline.outlinePaint.strokeCap = Paint.Cap.ROUND
-                            overlays.add(0, polyline)
+                            // Layer 1: Dark outer border / shadow glow for crisp visibility on satellite
+                            val outerBorder = Polyline().apply {
+                                setPoints(routePoints)
+                                outlinePaint.color = android.graphics.Color.parseColor("#00231C")
+                                outlinePaint.strokeWidth = 22f
+                                outlinePaint.strokeCap = Paint.Cap.ROUND
+                                outlinePaint.strokeJoin = Paint.Join.ROUND
+                            }
+                            overlays.add(outerBorder)
 
-                            // Center map on route midpoint
-                            val midLat = routePoints.map { it.latitude }.average()
-                            val midLon = routePoints.map { it.longitude }.average()
-                            controller.setCenter(GeoPoint(midLat, midLon))
+                            val isAccessible = result.edges.isEmpty() || result.edges.all { it.wheelchairAccessible }
+
+                            // Layer 2: Neon Cyan / Amber middle accent glow
+                            val midGlow = Polyline().apply {
+                                setPoints(routePoints)
+                                outlinePaint.color = android.graphics.Color.parseColor(
+                                    if (isAccessible) "#00E5FF" else "#FFB300"
+                                )
+                                outlinePaint.strokeWidth = 16f
+                                outlinePaint.strokeCap = Paint.Cap.ROUND
+                                outlinePaint.strokeJoin = Paint.Join.ROUND
+                            }
+                            overlays.add(midGlow)
+
+                            // Layer 3: Core Neon Path (Glowing Accessible Emerald Green or Warning Orange)
+                            val coreLine = Polyline().apply {
+                                setPoints(routePoints)
+                                outlinePaint.color = android.graphics.Color.parseColor(
+                                    if (isAccessible) "#00E676" else "#FF3D00"
+                                )
+                                outlinePaint.strokeWidth = 10f
+                                outlinePaint.strokeCap = Paint.Cap.ROUND
+                                outlinePaint.strokeJoin = Paint.Join.ROUND
+                            }
+                            overlays.add(coreLine)
+
+                            // Intermediate turn waypoint dots along the route
+                            for (i in 1 until routePoints.size - 1) {
+                                val wpMarker = Marker(this)
+                                wpMarker.position = routePoints[i]
+                                ContextCompat.getDrawable(ctx, R.drawable.ic_route_waypoint)?.let {
+                                    wpMarker.icon = it
+                                }
+                                wpMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                                val wpNode = graph.nodeById(result.path[i])
+                                wpMarker.title = wpNode?.name ?: "Step $i"
+                                wpMarker.snippet = "Campus Turn • Accessible Walkway"
+                                overlays.add(wpMarker)
+                            }
+
+                            // Distinct Green START Marker
+                            val startMarker = Marker(this)
+                            startMarker.position = routePoints.first()
+                            ContextCompat.getDrawable(ctx, R.drawable.ic_route_start)?.let {
+                                startMarker.icon = it
+                            }
+                            startMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                            val startNode = graph.nodeById(result.path.first())
+                            startMarker.title = "🟢 START: ${startNode?.name ?: "Origin"}"
+                            startMarker.snippet = startNode?.description ?: "Starting Point"
+                            overlays.add(startMarker)
+
+                            // Distinct Red DESTINATION Marker
+                            val destMarker = Marker(this)
+                            destMarker.position = routePoints.last()
+                            ContextCompat.getDrawable(ctx, R.drawable.ic_route_end)?.let {
+                                destMarker.icon = it
+                            }
+                            destMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                            val destNode = graph.nodeById(result.path.last())
+                            destMarker.title = "🏁 DESTINATION: ${destNode?.name ?: "Target"}"
+                            destMarker.snippet = destNode?.description ?: "Destination"
+                            overlays.add(destMarker)
+
+                            // Smoothly zoom and frame the entire route with padding
+                            post {
+                                try {
+                                    val bBox = BoundingBox.fromGeoPoints(routePoints)
+                                    zoomToBoundingBox(bBox.increaseByScale(1.35f), true, 130)
+                                } catch (e: Exception) {
+                                    val midLat = routePoints.map { it.latitude }.average()
+                                    val midLon = routePoints.map { it.longitude }.average()
+                                    controller.setCenter(GeoPoint(midLat, midLon))
+                                }
+                            }
                         }
                     }
                     invalidate()
                 }
             },
+            update = { mapView ->
+                val targetSource = if (isSatelliteView) GoogleSatelliteHybrid else TileSourceFactory.MAPNIK
+                if (mapView.tileProvider.tileSource.name() != targetSource.name()) {
+                    mapView.setTileSource(targetSource)
+                    mapView.invalidate()
+                }
+            },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Top bar
+        // Top bar with Satellite Toggle Button
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xEE1565C0))
+                .background(Color(0xEE0A192F))
                 .statusBarsPadding()
-                .padding(8.dp),
+                .padding(horizontal = 8.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = { navController.popBackStack() }) {
                 Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
             }
-            Text(
-                text = if (fromId.isEmpty()) "LPU Campus Map" else "Accessible Route",
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-                fontSize = 18.sp,
-                modifier = Modifier.weight(1f)
-            )
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = Color.White.copy(alpha = 0.2f),
-                modifier = Modifier.padding(end = 8.dp)
-            ) {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "${graph.nodes.size} Pins",
+                    text = if (fromId.isEmpty()) "LPU Campus Map" else "Accessible Campus Route",
                     color = Color.White,
-                    fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    fontSize = 17.sp
                 )
+                Text(
+                    text = if (isSatelliteView) "🛰️ Satellite View (Google Hybrid)" else "🗺️ Vector Street Map",
+                    color = if (isSatelliteView) Color(0xFF00E676) else Color(0xFFB0BEC5),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+
+            // Satellite vs Street Toggle Switch
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = if (isSatelliteView) Color(0xFF00E676) else Color.White.copy(alpha = 0.22f),
+                modifier = Modifier
+                    .padding(end = 4.dp)
+                    .clickable { isSatelliteView = !isSatelliteView }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (isSatelliteView) "🛰️ Satellite" else "🗺️ Street",
+                        color = if (isSatelliteView) Color(0xFF003300) else Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
         }
 
@@ -206,11 +327,22 @@ fun BuildingPictureCard(
     onFullDetails: () -> Unit
 ) {
     val context = LocalContext.current
-    // Check if custom picture exists in res/drawable named "pic_${node.id.lowercase()}"
     val imageResId = remember(node.id) {
-        val resourceName = "pic_${node.id.lowercase()}"
-        val resId = context.resources.getIdentifier(resourceName, "drawable", context.packageName)
-        if (resId != 0) resId else null
+        val cleanId = node.id.lowercase().replace("-", "_")
+        val numPart = cleanId.removePrefix("b")
+        val candidates = listOf(
+            "pic_$cleanId",
+            cleanId,
+            "b$numPart",
+            "pic_b$numPart",
+            "block_$numPart",
+            "block$numPart",
+            "pic_block_$numPart"
+        )
+        candidates.firstNotNullOfOrNull { name ->
+            val id = context.resources.getIdentifier(name, "drawable", context.packageName)
+            if (id != 0) id else null
+        }
     }
 
     Card(
