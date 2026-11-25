@@ -72,6 +72,13 @@ class CampusGraph(
     fun neighbors(nodeId: String): List<CampusEdge> = adjacency[nodeId].orEmpty()
     fun nodeById(id: String): CampusNode? = nodes.find { it.id == id }
     val buildings: List<CampusNode> get() = nodes.filter { it.isBuilding }
+
+    /** Returns the nearest surveyed node and its distance in meters to the given GPS coordinates. */
+    fun nearestNodeWithDistance(lat: Double, lon: Double): Pair<CampusNode, Double>? {
+        return nodes
+            .map { it to haversineDistance(lat, lon, it.latitude, it.longitude) }
+            .minByOrNull { it.second }
+    }
 }
 
 /** Haversine distance in meters between two lat/lng coordinates */

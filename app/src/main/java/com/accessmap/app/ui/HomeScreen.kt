@@ -31,6 +31,7 @@ fun HomeScreen(navController: NavHostController) {
     var toExpanded by remember { mutableStateOf(false) }
     var selectedFromId by remember { mutableStateOf("") }
     var selectedToId by remember { mutableStateOf("") }
+    var gpsStatusMessage by remember { mutableStateOf<String?>(null) }
 
     val selectedFromName = allLocations.find { it.id == selectedFromId }?.name ?: ""
     val selectedToName = allLocations.find { it.id == selectedToId }?.name ?: ""
@@ -83,7 +84,22 @@ fun HomeScreen(navController: NavHostController) {
                     Text("📍 Quick Accessible Routing", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     Spacer(Modifier.height(12.dp))
 
-                    Text("Start Location:", fontSize = 12.sp, color = Color.Gray, fontWeight = FontWeight.Medium)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Start Location:", fontSize = 12.sp, color = Color.Gray, fontWeight = FontWeight.Medium)
+                        UseMyGpsChip(
+                            graph = graph,
+                            onNodeResolved = { nodeId, msg ->
+                                selectedFromId = nodeId
+                                gpsStatusMessage = msg
+                            },
+                            onStatusMessage = { msg -> gpsStatusMessage = msg }
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
                     ExposedDropdownMenuBox(
                         expanded = fromExpanded,
                         onExpandedChange = { fromExpanded = it }
@@ -106,11 +122,21 @@ fun HomeScreen(navController: NavHostController) {
                                     text = { Text(node.name, fontSize = 13.sp) },
                                     onClick = {
                                         selectedFromId = node.id
+                                        gpsStatusMessage = null
                                         fromExpanded = false
                                     }
                                 )
                             }
                         }
+                    }
+
+                    gpsStatusMessage?.let { status ->
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = status,
+                            fontSize = 11.sp,
+                            color = if (status.startsWith("📍")) Color(0xFF2E7D32) else Color(0xFFE65100)
+                        )
                     }
 
                     Spacer(Modifier.height(8.dp))

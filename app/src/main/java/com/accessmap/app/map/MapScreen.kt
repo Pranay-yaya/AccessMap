@@ -1,18 +1,24 @@
 package com.accessmap.app.map
 
+import android.Manifest
 import android.content.Context
+import android.graphics.DashPathEffect
 import android.graphics.Paint
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -23,6 +29,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -30,14 +37,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.navigation.NavHostController
 import com.accessmap.app.R
 import com.accessmap.app.routing.AccessibilityRouter
+import com.accessmap.app.routing.CampusLocationHelper
 import com.accessmap.app.routing.CampusNode
+import com.accessmap.app.routing.GpsOriginResult
 import com.accessmap.app.routing.LPU_CAMPUS_NODES
 import com.accessmap.app.routing.LpuCampusData
 import com.accessmap.app.routing.RouteResult
-import androidx.compose.foundation.clickable
+import com.accessmap.app.routing.haversineDistance
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.BoundingBox
@@ -46,6 +57,8 @@ import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
+import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 
 // LPU main campus center (Central Library / Administration area)
 val LPU_CENTER = GeoPoint(31.2525, 75.7038)
@@ -84,13 +97,64 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
     }
 
     var isSatelliteView by remember { mutableStateOf(true) }
+    var followUser by remember { mutableStateOf(false) }
+    var hasLocationPermission by remember {
+        mutableStateOf(CampusLocationHelper.hasLocationPermission(context))
+    }
+    var mapViewRef by remember { mutableStateOf<MapView?>(null) }
+    var myLocationOverlayRef by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
+    var locationNotice by remember { mutableStateOf<String?>(null) }
     var showRouteInfo by remember { mutableStateOf(routeResult != null) }
     var selectedNode by remember { mutableStateOf<CampusNode?>(null) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { perms ->
+        val granted = perms[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            perms[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        hasLocationPermission = granted
+        if (granted) {
+            myLocationOverlayRef?.enableMyLocation()
+            myLocationOverlayRef?.enableFollowLocation()
+            followUser = true
+            locationNotice = "📡 Live GPS enabled — waiting for satellite lock..."
+        } else {
+            locationNotice = "⚠️ Location permission denied. Map works without live GPS dot."
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, mapViewRef, myLocationOverlayRef) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    mapViewRef?.onResume()
+                    if (CampusLocationHelper.hasLocationPermission(context)) {
+                        myLocationOverlayRef?.enableMyLocation()
+                        if (followUser) myLocationOverlayRef?.enableFollowLocation()
+                    }
+                }
+                Lifecycle.Event.ON_PAUSE -> {
+                    myLocationOverlayRef?.disableFollowLocation()
+                    myLocationOverlayRef?.disableMyLocation()
+                    mapViewRef?.onPause()
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            myLocationOverlayRef?.disableMyLocation()
+        }
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
             factory = { ctx ->
                 MapView(ctx).apply {
+                    mapViewRef = this
                     setTileSource(if (isSatelliteView) GoogleSatelliteHybrid else TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
                     controller.setZoom(17.5)
@@ -167,6 +231,24 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                             }
                             overlays.add(coreLine)
 
+                            // Dashed connector from live GPS position to route start if standing on campus
+                            CampusLocationHelper.getBestLastKnownLocation(ctx)?.let { gpsLoc ->
+                                val distToStart = haversineDistance(
+                                    gpsLoc.latitude, gpsLoc.longitude,
+                                    routePoints.first().latitude, routePoints.first().longitude
+                                )
+                                if (distToStart in 8.0..CampusLocationHelper.MAX_CAMPUS_RADIUS_METERS) {
+                                    val walkInLine = Polyline().apply {
+                                        setPoints(listOf(GeoPoint(gpsLoc.latitude, gpsLoc.longitude), routePoints.first()))
+                                        outlinePaint.color = android.graphics.Color.parseColor("#2979FF")
+                                        outlinePaint.strokeWidth = 10f
+                                        outlinePaint.strokeCap = Paint.Cap.ROUND
+                                        outlinePaint.pathEffect = DashPathEffect(floatArrayOf(20f, 16f), 0f)
+                                    }
+                                    overlays.add(walkInLine)
+                                }
+                            }
+
                             // Intermediate turn waypoint dots along the route
                             for (i in 1 until routePoints.size - 1) {
                                 val wpMarker = Marker(this)
@@ -218,6 +300,16 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                             }
                         }
                     }
+
+                    // Live "You Are Here" blue dot GPS overlay (no API key needed)
+                    val myLocationOverlay = MyLocationNewOverlay(GpsMyLocationProvider(ctx), this).apply {
+                        if (hasLocationPermission) {
+                            enableMyLocation()
+                        }
+                    }
+                    myLocationOverlayRef = myLocationOverlay
+                    overlays.add(myLocationOverlay)
+
                     invalidate()
                 }
             },
@@ -231,52 +323,157 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
             modifier = Modifier.fillMaxSize()
         )
 
-        // Top bar with Satellite Toggle Button
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xEE0A192F))
-                .statusBarsPadding()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = { navController.popBackStack() }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
-            }
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = if (fromId.isEmpty()) "LPU Campus Map" else "Accessible Campus Route",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 17.sp
-                )
-                Text(
-                    text = if (isSatelliteView) "🛰️ Satellite View (Google Hybrid)" else "🗺️ Vector Street Map",
-                    color = if (isSatelliteView) Color(0xFF00E676) else Color(0xFFB0BEC5),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium
-                )
-            }
-
-            // Satellite vs Street Toggle Switch
-            Surface(
-                shape = RoundedCornerShape(20.dp),
-                color = if (isSatelliteView) Color(0xFF00E676) else Color.White.copy(alpha = 0.22f),
+        // Top bar + optional GPS feedback banner
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
                 modifier = Modifier
-                    .padding(end = 4.dp)
-                    .clickable { isSatelliteView = !isSatelliteView }
+                    .fillMaxWidth()
+                    .background(Color(0xEE0A192F))
+                    .statusBarsPadding()
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                IconButton(onClick = { navController.popBackStack() }) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
+                }
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (isSatelliteView) "🛰️ Satellite" else "🗺️ Street",
-                        color = if (isSatelliteView) Color(0xFF003300) else Color.White,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
+                        text = if (fromId.isEmpty()) "LPU Campus Map" else "Accessible Campus Route",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 17.sp
+                    )
+                    Text(
+                        text = if (isSatelliteView) "🛰️ Satellite View (Google Hybrid)" else "🗺️ Vector Street Map",
+                        color = if (isSatelliteView) Color(0xFF00E676) else Color(0xFFB0BEC5),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
                     )
                 }
+
+                // Satellite vs Street Toggle Switch
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = if (isSatelliteView) Color(0xFF00E676) else Color.White.copy(alpha = 0.22f),
+                    modifier = Modifier
+                        .padding(end = 4.dp)
+                        .clickable { isSatelliteView = !isSatelliteView }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (isSatelliteView) "🛰️ Satellite" else "🗺️ Street",
+                            color = if (isSatelliteView) Color(0xFF003300) else Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            locationNotice?.let { msg ->
+                Surface(
+                    color = Color(0xEE102A43),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .clickable { locationNotice = null }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = msg,
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Dismiss",
+                            tint = Color(0xFF9FB3C8),
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        // Right-side Map Controls: My Location (Blue Dot / Follow) + Center LPU
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .statusBarsPadding()
+                .padding(top = 74.dp, end = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            SmallFloatingActionButton(
+                onClick = {
+                    if (!CampusLocationHelper.hasLocationPermission(context)) {
+                        locationPermissionLauncher.launch(
+                            arrayOf(
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                Manifest.permission.ACCESS_COARSE_LOCATION
+                            )
+                        )
+                        return@SmallFloatingActionButton
+                    }
+
+                    val overlay = myLocationOverlayRef
+                    overlay?.enableMyLocation()
+                    val currentGeo = overlay?.myLocation
+                        ?: CampusLocationHelper.getBestLastKnownLocation(context)?.let {
+                            GeoPoint(it.latitude, it.longitude)
+                        }
+
+                    if (currentGeo != null) {
+                        val nextFollow = !followUser
+                        followUser = nextFollow
+                        if (nextFollow) {
+                            overlay?.enableFollowLocation()
+                            mapViewRef?.controller?.animateTo(currentGeo)
+                            mapViewRef?.controller?.setZoom(18.5)
+                            val distFromCampus = haversineDistance(
+                                currentGeo.latitude, currentGeo.longitude,
+                                LPU_CENTER.latitude, LPU_CENTER.longitude
+                            )
+                            locationNotice = if (distFromCampus > CampusLocationHelper.MAX_CAMPUS_RADIUS_METERS) {
+                                "📍 GPS is ${(distFromCampus / 1000).toInt()} km away. On emulator: Extended Controls → Location → 31.2525, 75.7038"
+                            } else {
+                                "📍 Following your live GPS position (tap again to unlock pan)"
+                            }
+                        } else {
+                            overlay?.disableFollowLocation()
+                            locationNotice = null
+                        }
+                    } else {
+                        followUser = true
+                        overlay?.enableFollowLocation()
+                        locationNotice = "📡 Waiting for GPS lock... (On emulator: Extended Controls → Location)"
+                    }
+                },
+                containerColor = if (followUser) Color(0xFF00E676) else Color.White,
+                contentColor = if (followUser) Color(0xFF003300) else Color(0xFF1565C0)
+            ) {
+                Icon(Icons.Default.MyLocation, contentDescription = "My Live Location")
+            }
+
+            SmallFloatingActionButton(
+                onClick = {
+                    followUser = false
+                    myLocationOverlayRef?.disableFollowLocation()
+                    mapViewRef?.controller?.animateTo(LPU_CENTER)
+                    mapViewRef?.controller?.setZoom(17.5)
+                    locationNotice = null
+                },
+                containerColor = Color.White,
+                contentColor = Color(0xFF1565C0)
+            ) {
+                Icon(Icons.Default.CenterFocusStrong, contentDescription = "Center on LPU Campus")
             }
         }
 
@@ -304,7 +501,16 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     node = node,
                     onDismiss = { selectedNode = null },
                     onNavigateTo = {
-                        val origin = LPU_CAMPUS_NODES.firstOrNull { it.id == "MAIN_GATE" }?.id ?: "MAIN_GATE"
+                        val gpsOrigin = CampusLocationHelper.nearestCampusNodeFromGps(
+                            context, graph, myLocationOverlayRef?.lastFix
+                        )
+                        val origin = when {
+                            gpsOrigin is GpsOriginResult.Success && gpsOrigin.node.id != node.id ->
+                                gpsOrigin.node.id
+                            node.id != "MAIN_GATE" ->
+                                LPU_CAMPUS_NODES.firstOrNull { it.id == "MAIN_GATE" }?.id ?: "MAIN_GATE"
+                            else -> "B1"
+                        }
                         navController.navigate("navigate/$origin/${node.id}")
                     },
                     onFullDetails = {
