@@ -409,7 +409,26 @@ fun NavigationScreen(
                                 RouteStatBadge("🏛️", "${result.path.size}", "Waypoints")
                             }
 
-                            Spacer(Modifier.height(14.dp))
+                            Spacer(Modifier.height(12.dp))
+
+                            if (result.path.size >= 2) {
+                                val startNode = graph.nodeById(result.path[0])
+                                val nextNode = graph.nodeById(result.path[1])
+                                if (startNode != null && nextNode != null) {
+                                    val bearing = remember(startNode.id, nextNode.id) {
+                                        calculateBearingDegrees(
+                                            startNode.latitude, startNode.longitude,
+                                            nextNode.latitude, nextNode.longitude
+                                        )
+                                    }
+                                    RouteCompassCard(
+                                        targetBearingDegrees = bearing,
+                                        nextStopName = nextNode.name,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                    Spacer(Modifier.height(12.dp))
+                                }
+                            }
 
                             Button(
                                 onClick = {

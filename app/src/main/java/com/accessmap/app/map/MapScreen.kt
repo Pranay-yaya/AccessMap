@@ -64,7 +64,10 @@ import com.accessmap.app.routing.RouteResult
 import com.accessmap.app.routing.haversineDistance
 import com.accessmap.app.ui.LocalAppSettings
 import com.accessmap.app.ui.LocalVoiceGuidance
+import com.accessmap.app.ui.RouteCompassCard
 import com.accessmap.app.ui.StartingRouteOverlay
+import com.accessmap.app.ui.bearingToFullDirection
+import com.accessmap.app.ui.calculateBearingDegrees
 import com.accessmap.app.ui.createWalkingCharacterDrawable
 import org.osmdroid.tileprovider.cachemanager.CacheManager
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
@@ -638,6 +641,25 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     }
                 }
             }
+
+            // Live Compass + Route Direction Card when routing is active
+            routeResult?.takeIf { it.path.size >= 2 }?.let { result ->
+                val fromNode = graph.nodeById(result.path[0])
+                val nextNode = graph.nodeById(result.path[1])
+                if (fromNode != null && nextNode != null) {
+                    val bearing = remember(fromNode.id, nextNode.id) {
+                        calculateBearingDegrees(
+                            fromNode.latitude, fromNode.longitude,
+                            nextNode.latitude, nextNode.longitude
+                        )
+                    }
+                    RouteCompassCard(
+                        targetBearingDegrees = bearing,
+                        nextStopName = nextNode.name,
+                        modifier = Modifier.padding(start = 12.dp, end = 68.dp, top = 6.dp)
+                    )
+                }
+            }
         }
 
         // Right-side Map Controls: My Location, Center LPU, Offline Campus Tiles
@@ -790,8 +812,16 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     val dist = routeResult.totalDistanceMeters.toInt()
                     val mins = (dist / 80).coerceAtLeast(1)
                     val mode = if (stepFreeOnly) "step-free" else "shortest"
+                    val dirPhrase = if (routeResult.path.size >= 2) {
+                        val s = graph.nodeById(routeResult.path[0])
+                        val n = graph.nodeById(routeResult.path[1])
+                        if (s != null && n != null) {
+                            val b = calculateBearingDegrees(s.latitude, s.longitude, n.latitude, n.longitude)
+                            " Head ${bearingToFullDirection(b)} toward ${n.name}."
+                        } else ""
+                    } else ""
                     voice.speak(
-                        "Showing $mode route from $fromName to $toName, $dist meters, about $mins minutes.",
+                        "Showing $mode route from $fromName to $toName, $dist meters, about $mins minutes.$dirPhrase",
                         true
                     )
                 },
