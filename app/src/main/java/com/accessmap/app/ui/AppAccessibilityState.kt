@@ -19,6 +19,7 @@ private const val KEY_LARGE_TEXT = "large_text"
 private const val KEY_VOICE = "voice_guidance"
 private const val KEY_ONBOARDING = "onboarding_seen"
 private const val KEY_FAVORITES = "favorite_nodes"
+private const val KEY_ANIMATIONS = "route_animations"
 
 @Stable
 class AppSettingsState(private val context: Context) {
@@ -36,6 +37,13 @@ class AppSettingsState(private val context: Context) {
         private set
     var favoriteIds by mutableStateOf(prefs.getStringSet(KEY_FAVORITES, emptySet())?.toSet() ?: emptySet())
         private set
+    var animationsEnabled by mutableStateOf(prefs.getBoolean(KEY_ANIMATIONS, true))
+        private set
+
+    fun toggleAnimations(enabled: Boolean) {
+        animationsEnabled = enabled
+        prefs.edit().putBoolean(KEY_ANIMATIONS, enabled).apply()
+    }
 
     fun toggleDarkTheme(enabled: Boolean) {
         darkTheme = enabled

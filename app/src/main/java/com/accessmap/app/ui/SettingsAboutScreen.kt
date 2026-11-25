@@ -136,6 +136,18 @@ fun SettingsAboutScreen(navController: NavHostController) {
                             settings.toggleDarkTheme(it)
                         }
                     )
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp))
+
+                    SettingsSwitchRow(
+                        icon = Icons.Default.Animation,
+                        title = "Route Animations",
+                        subtitle = "Show walking character overlay and animated route preview on map",
+                        checked = settings.animationsEnabled,
+                        onCheckedChange = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            settings.toggleAnimations(it)
+                        }
+                    )
                 }
             }
 

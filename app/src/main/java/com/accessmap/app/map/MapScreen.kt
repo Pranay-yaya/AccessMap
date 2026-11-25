@@ -13,7 +13,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -61,6 +64,8 @@ import com.accessmap.app.routing.RouteResult
 import com.accessmap.app.routing.haversineDistance
 import com.accessmap.app.ui.LocalAppSettings
 import com.accessmap.app.ui.LocalVoiceGuidance
+import com.accessmap.app.ui.StartingRouteOverlay
+import com.accessmap.app.ui.createWalkingCharacterDrawable
 import org.osmdroid.tileprovider.cachemanager.CacheManager
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
@@ -145,6 +150,71 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
     val dynamicOverlays = remember { mutableListOf<Overlay>() }
     var lastOverlayKey by remember { mutableStateOf<String?>(null) }
     var lastZoomedRouteKey by remember { mutableStateOf<String?>(null) }
+    var showStartingOverlay by remember(fromId, toId) {
+        mutableStateOf(fromId.isNotEmpty() && toId.isNotEmpty() && settings.animationsEnabled)
+    }
+    var walkerMarkerRef by remember { mutableStateOf<Marker?>(null) }
+
+    LaunchedEffect(fromId, toId, settings.animationsEnabled) {
+        if (fromId.isNotEmpty() && toId.isNotEmpty() && settings.animationsEnabled) {
+            showStartingOverlay = true
+            delay(2000L)
+            showStartingOverlay = false
+        } else {
+            showStartingOverlay = false
+        }
+    }
+
+    // Animate cartoon walker marker along the active route on the map
+    LaunchedEffect(routeResult, settings.animationsEnabled, showStartingOverlay, mapViewRef) {
+        val mv = mapViewRef ?: return@LaunchedEffect
+        val points = routeResult?.path?.mapNotNull { id ->
+            graph.nodeById(id)?.let { GeoPoint(it.latitude, it.longitude) }
+        } ?: emptyList()
+
+        if (!settings.animationsEnabled || points.size < 2 || showStartingOverlay) {
+            walkerMarkerRef?.let {
+                mv.overlays.remove(it)
+                mv.postInvalidate()
+            }
+            walkerMarkerRef = null
+            return@LaunchedEffect
+        }
+
+        val walker = walkerMarkerRef ?: Marker(mv).apply {
+            icon = createWalkingCharacterDrawable(context)
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            title = "Route Preview"
+            snippet = "Walking along accessible route"
+        }.also {
+            walkerMarkerRef = it
+            mv.overlays.add(it)
+        }
+
+        try {
+            while (isActive) {
+                for (i in 0 until points.size - 1) {
+                    val startPt = points[i]
+                    val endPt = points[i + 1]
+                    val steps = 36
+                    for (step in 0..steps) {
+                        if (!isActive) break
+                        val t = step / steps.toDouble()
+                        val lat = startPt.latitude + (endPt.latitude - startPt.latitude) * t
+                        val lon = startPt.longitude + (endPt.longitude - startPt.longitude) * t
+                        walker.position = GeoPoint(lat, lon)
+                        mv.postInvalidate()
+                        delay(40L)
+                    }
+                }
+                delay(800L)
+            }
+        } finally {
+            mv.overlays.remove(walker)
+            mv.postInvalidate()
+            if (walkerMarkerRef == walker) walkerMarkerRef = null
+        }
+    }
 
     val lifecycleOwner = LocalLifecycleOwner.current
 
@@ -464,6 +534,10 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     if (myLocOverlay != null) {
                         mapView.overlays.add(myLocOverlay)
                     }
+                    walkerMarkerRef?.let {
+                        mapView.overlays.remove(it)
+                        mapView.overlays.add(it)
+                    }
                     mapView.invalidate()
                 }
             },
@@ -769,6 +843,19 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     }
                 )
             }
+        }
+
+        // 2-second "Starting your route..." walking cartoon overlay (tap to skip)
+        AnimatedVisibility(
+            visible = showStartingOverlay,
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
+            val destName = graph.nodeById(toId)?.name ?: toId
+            StartingRouteOverlay(
+                destinationName = destName,
+                onDismiss = { showStartingOverlay = false }
+            )
         }
     }
 }
