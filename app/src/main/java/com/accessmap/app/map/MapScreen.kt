@@ -1,9 +1,14 @@
 package com.accessmap.app.map
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.DashPathEffect
 import android.graphics.Paint
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.os.Bundle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -24,15 +29,17 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -41,6 +48,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.navigation.NavHostController
 import com.accessmap.app.R
+import com.accessmap.app.database.AppDatabase
+import com.accessmap.app.database.HazardEntity
+import com.accessmap.app.repository.AccessMapRepository
 import com.accessmap.app.routing.AccessibilityRouter
 import com.accessmap.app.routing.CampusLocationHelper
 import com.accessmap.app.routing.CampusNode
@@ -49,6 +59,9 @@ import com.accessmap.app.routing.LPU_CAMPUS_NODES
 import com.accessmap.app.routing.LpuCampusData
 import com.accessmap.app.routing.RouteResult
 import com.accessmap.app.routing.haversineDistance
+import com.accessmap.app.ui.LocalAppSettings
+import com.accessmap.app.ui.LocalVoiceGuidance
+import org.osmdroid.tileprovider.cachemanager.CacheManager
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.BoundingBox
@@ -56,6 +69,7 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Overlay
 import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
@@ -77,35 +91,60 @@ val GoogleSatelliteHybrid = object : OnlineTileSourceBase(
 ) {
     override fun getTileURLString(pMapTileIndex: Long): String {
         return baseUrl +
-                "&hl=en&x=" + MapTileIndex.getX(pMapTileIndex) +
-                "&y=" + MapTileIndex.getY(pMapTileIndex) +
-                "&z=" + MapTileIndex.getZoom(pMapTileIndex)
+            "&hl=en&x=" + MapTileIndex.getX(pMapTileIndex) +
+            "&y=" + MapTileIndex.getY(pMapTileIndex) +
+            "&z=" + MapTileIndex.getZoom(pMapTileIndex)
     }
 }
 
+@SuppressLint("MissingPermission")
 @Composable
 fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+    val settings = LocalAppSettings.current
+    val voice = LocalVoiceGuidance.current
+
     val graph = remember { LpuCampusData.buildGraph(context) }
     val router = remember { AccessibilityRouter(graph) }
+    val repository = remember {
+        AccessMapRepository(AppDatabase.getInstance(context).hazardDao(), graph)
+    }
+    val activeHazards by repository.activeHazards().collectAsState(initial = emptyList())
+    val blockedNodeIds = remember(activeHazards) {
+        activeHazards.mapNotNull { it.nodeId.ifBlank { null } }.toSet()
+    }
 
-    val routeResult = remember(fromId, toId) {
-        if (fromId.isNotEmpty() && toId.isNotEmpty()) {
-            router.findAccessibleRoute(fromId, toId)
-                ?: router.findNormalRoute(fromId, toId)
+    var activeFromId by remember(fromId) { mutableStateOf(fromId) }
+    var stepFreeOnly by remember { mutableStateOf(true) }
+
+    val routeResult = remember(activeFromId, toId, stepFreeOnly, blockedNodeIds) {
+        if (activeFromId.isNotEmpty() && toId.isNotEmpty()) {
+            if (stepFreeOnly) {
+                router.findAccessibleRoute(activeFromId, toId, blockedNodeIds)
+                    ?: router.findNormalRoute(activeFromId, toId, blockedNodeIds)
+            } else {
+                router.findNormalRoute(activeFromId, toId, blockedNodeIds)
+            }
         } else null
     }
 
     var isSatelliteView by remember { mutableStateOf(true) }
     var followUser by remember { mutableStateOf(false) }
+    var isDownloadingTiles by remember { mutableStateOf(false) }
+    var hasArrived by remember(toId) { mutableStateOf(false) }
     var hasLocationPermission by remember {
         mutableStateOf(CampusLocationHelper.hasLocationPermission(context))
     }
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
     var myLocationOverlayRef by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
     var locationNotice by remember { mutableStateOf<String?>(null) }
-    var showRouteInfo by remember { mutableStateOf(routeResult != null) }
+    var showRouteInfo by remember(routeResult) { mutableStateOf(routeResult != null) }
     var selectedNode by remember { mutableStateOf<CampusNode?>(null) }
+
+    val dynamicOverlays = remember { mutableListOf<Overlay>() }
+    var lastOverlayKey by remember { mutableStateOf<String?>(null) }
+    var lastZoomedRouteKey by remember { mutableStateOf<String?>(null) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
 
@@ -122,6 +161,81 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
             locationNotice = "📡 Live GPS enabled — waiting for satellite lock..."
         } else {
             locationNotice = "⚠️ Location permission denied. Tap here to open App Settings and allow Location."
+        }
+    }
+
+    // Off-route re-routing & arrival alert when navigating to a destination
+    val latestRoute by rememberUpdatedState(routeResult)
+    val latestFromId by rememberUpdatedState(activeFromId)
+    DisposableEffect(toId, hasLocationPermission) {
+        if (toId.isEmpty() || !hasLocationPermission) {
+            return@DisposableEffect onDispose {}
+        }
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            ?: return@DisposableEffect onDispose {}
+        var lastRerouteAt = 0L
+
+        val listener = object : LocationListener {
+            override fun onLocationChanged(loc: Location) {
+                val destNode = graph.nodeById(toId) ?: return
+                val distToDest = haversineDistance(
+                    loc.latitude, loc.longitude,
+                    destNode.latitude, destNode.longitude
+                )
+                if (distToDest <= 25.0 && !hasArrived) {
+                    hasArrived = true
+                    locationNotice = "🎉 You have arrived at ${destNode.name}!"
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    voice.speak("You have arrived at ${destNode.name}", settings.voiceGuidance)
+                    return
+                }
+
+                val currentRoute = latestRoute ?: return
+                val minPathDist = currentRoute.path.mapNotNull { graph.nodeById(it) }
+                    .minOfOrNull { node ->
+                        haversineDistance(loc.latitude, loc.longitude, node.latitude, node.longitude)
+                    } ?: return
+
+                val now = System.currentTimeMillis()
+                if (minPathDist > 60.0 && now - lastRerouteAt > 8000L) {
+                    val (nearest, distToNearest) = graph.nearestNodeWithDistance(
+                        loc.latitude, loc.longitude
+                    ) ?: return
+                    if (distToNearest <= CampusLocationHelper.MAX_CAMPUS_RADIUS_METERS &&
+                        nearest.id != latestFromId
+                    ) {
+                        lastRerouteAt = now
+                        activeFromId = nearest.id
+                        locationNotice = "🔄 Off-route! Re-routing from ${nearest.name}..."
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        voice.speak(
+                            "Off route. Re-routing from ${nearest.name}",
+                            settings.voiceGuidance
+                        )
+                    }
+                }
+            }
+
+            @Deprecated("Deprecated in Android API 29")
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            override fun onProviderEnabled(provider: String) {}
+            override fun onProviderDisabled(provider: String) {}
+        }
+
+        try {
+            if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 4000L, 5f, listener)
+            } else if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 4000L, 5f, listener)
+            }
+        } catch (_: Exception) {
+        }
+
+        onDispose {
+            try {
+                lm.removeUpdates(listener)
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -163,14 +277,13 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     val buildingIconNormal = ContextCompat.getDrawable(ctx, R.drawable.ic_map_building)
                     val buildingIconWarning = ContextCompat.getDrawable(ctx, R.drawable.ic_map_building_warning)
 
-                    // Add all campus node markers with custom building icons
+                    // Add all 47 campus node markers
                     graph.nodes.forEach { node ->
                         val marker = Marker(this)
                         marker.position = GeoPoint(node.latitude, node.longitude)
                         marker.title = node.name
                         marker.snippet = buildSnippet(node)
 
-                        // Set custom building icon instead of generic finger/pin
                         if (node.hasRamp) {
                             buildingIconNormal?.let { marker.icon = it }
                         } else {
@@ -178,127 +291,13 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                         }
 
                         marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-
-                        // Clicking icon opens the rich Building Detail bottom sheet with Big Picture
                         marker.setOnMarkerClickListener { _, _ ->
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             selectedNode = node
                             showRouteInfo = false
                             true
                         }
-
                         overlays.add(marker)
-                    }
-
-                    // Draw colorful high-contrast route polyline and waypoint pins if available
-                    routeResult?.let { result ->
-                        val routePoints = result.path.mapNotNull { nodeId ->
-                            graph.nodeById(nodeId)?.let { GeoPoint(it.latitude, it.longitude) }
-                        }
-                        if (routePoints.size >= 2) {
-                            // Layer 1: Dark outer border / shadow glow for crisp visibility on satellite
-                            val outerBorder = Polyline().apply {
-                                setPoints(routePoints)
-                                outlinePaint.color = android.graphics.Color.parseColor("#00231C")
-                                outlinePaint.strokeWidth = 22f
-                                outlinePaint.strokeCap = Paint.Cap.ROUND
-                                outlinePaint.strokeJoin = Paint.Join.ROUND
-                            }
-                            overlays.add(outerBorder)
-
-                            val isAccessible = result.edges.isEmpty() || result.edges.all { it.wheelchairAccessible }
-
-                            // Layer 2: Neon Cyan / Amber middle accent glow
-                            val midGlow = Polyline().apply {
-                                setPoints(routePoints)
-                                outlinePaint.color = android.graphics.Color.parseColor(
-                                    if (isAccessible) "#00E5FF" else "#FFB300"
-                                )
-                                outlinePaint.strokeWidth = 16f
-                                outlinePaint.strokeCap = Paint.Cap.ROUND
-                                outlinePaint.strokeJoin = Paint.Join.ROUND
-                            }
-                            overlays.add(midGlow)
-
-                            // Layer 3: Core Neon Path (Glowing Accessible Emerald Green or Warning Orange)
-                            val coreLine = Polyline().apply {
-                                setPoints(routePoints)
-                                outlinePaint.color = android.graphics.Color.parseColor(
-                                    if (isAccessible) "#00E676" else "#FF3D00"
-                                )
-                                outlinePaint.strokeWidth = 10f
-                                outlinePaint.strokeCap = Paint.Cap.ROUND
-                                outlinePaint.strokeJoin = Paint.Join.ROUND
-                            }
-                            overlays.add(coreLine)
-
-                            // Dashed connector from live GPS position to route start if standing on campus
-                            CampusLocationHelper.getBestLastKnownLocation(ctx)?.let { gpsLoc ->
-                                val distToStart = haversineDistance(
-                                    gpsLoc.latitude, gpsLoc.longitude,
-                                    routePoints.first().latitude, routePoints.first().longitude
-                                )
-                                if (distToStart in 8.0..CampusLocationHelper.MAX_CAMPUS_RADIUS_METERS) {
-                                    val walkInLine = Polyline().apply {
-                                        setPoints(listOf(GeoPoint(gpsLoc.latitude, gpsLoc.longitude), routePoints.first()))
-                                        outlinePaint.color = android.graphics.Color.parseColor("#2979FF")
-                                        outlinePaint.strokeWidth = 10f
-                                        outlinePaint.strokeCap = Paint.Cap.ROUND
-                                        outlinePaint.pathEffect = DashPathEffect(floatArrayOf(20f, 16f), 0f)
-                                    }
-                                    overlays.add(walkInLine)
-                                }
-                            }
-
-                            // Intermediate turn waypoint dots along the route
-                            for (i in 1 until routePoints.size - 1) {
-                                val wpMarker = Marker(this)
-                                wpMarker.position = routePoints[i]
-                                ContextCompat.getDrawable(ctx, R.drawable.ic_route_waypoint)?.let {
-                                    wpMarker.icon = it
-                                }
-                                wpMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                                val wpNode = graph.nodeById(result.path[i])
-                                wpMarker.title = wpNode?.name ?: "Step $i"
-                                wpMarker.snippet = "Campus Turn • Accessible Walkway"
-                                overlays.add(wpMarker)
-                            }
-
-                            // Distinct Green START Marker
-                            val startMarker = Marker(this)
-                            startMarker.position = routePoints.first()
-                            ContextCompat.getDrawable(ctx, R.drawable.ic_route_start)?.let {
-                                startMarker.icon = it
-                            }
-                            startMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                            val startNode = graph.nodeById(result.path.first())
-                            startMarker.title = "🟢 START: ${startNode?.name ?: "Origin"}"
-                            startMarker.snippet = startNode?.description ?: "Starting Point"
-                            overlays.add(startMarker)
-
-                            // Distinct Red DESTINATION Marker
-                            val destMarker = Marker(this)
-                            destMarker.position = routePoints.last()
-                            ContextCompat.getDrawable(ctx, R.drawable.ic_route_end)?.let {
-                                destMarker.icon = it
-                            }
-                            destMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                            val destNode = graph.nodeById(result.path.last())
-                            destMarker.title = "🏁 DESTINATION: ${destNode?.name ?: "Target"}"
-                            destMarker.snippet = destNode?.description ?: "Destination"
-                            overlays.add(destMarker)
-
-                            // Smoothly zoom and frame the entire route with padding
-                            post {
-                                try {
-                                    val bBox = BoundingBox.fromGeoPoints(routePoints)
-                                    zoomToBoundingBox(bBox.increaseByScale(1.35f), true, 130)
-                                } catch (e: Exception) {
-                                    val midLat = routePoints.map { it.latitude }.average()
-                                    val midLon = routePoints.map { it.longitude }.average()
-                                    controller.setCenter(GeoPoint(midLat, midLon))
-                                }
-                            }
-                        }
                     }
 
                     // Live "You Are Here" blue dot GPS overlay (no API key needed)
@@ -317,13 +316,161 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                 val targetSource = if (isSatelliteView) GoogleSatelliteHybrid else TileSourceFactory.MAPNIK
                 if (mapView.tileProvider.tileSource.name() != targetSource.name()) {
                     mapView.setTileSource(targetSource)
+                }
+
+                val routeKey = routeResult?.let {
+                    "${it.path.joinToString(",")}:$stepFreeOnly:${it.avoidedHazards}"
+                } ?: "none"
+                val hazardKey = activeHazards.joinToString(";") {
+                    "${it.id}:${it.confirmations}:${it.nodeId}"
+                }
+                val combinedKey = "$routeKey|$hazardKey"
+
+                if (lastOverlayKey != combinedKey) {
+                    lastOverlayKey = combinedKey
+                    mapView.overlays.removeAll(dynamicOverlays)
+                    dynamicOverlays.clear()
+
+                    val myLocOverlay = myLocationOverlayRef
+                    if (myLocOverlay != null) {
+                        mapView.overlays.remove(myLocOverlay)
+                    }
+
+                    // Render active hazard & AI-confirmed markers
+                    val hazardIcon = ContextCompat.getDrawable(context, R.drawable.ic_map_building_warning)
+                    activeHazards.forEach { hazard: HazardEntity ->
+                        val hm = Marker(mapView).apply {
+                            position = GeoPoint(hazard.latitude, hazard.longitude)
+                            title = "⚠️ ${hazard.type.name.replace('_', ' ')}"
+                            snippet = "${hazard.description} (Confirmed ${hazard.confirmations}x)"
+                            hazardIcon?.let { icon = it }
+                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                        }
+                        dynamicOverlays.add(hm)
+                        mapView.overlays.add(hm)
+                    }
+
+                    // Draw route polyline & pins
+                    routeResult?.let { result ->
+                        val routePoints = result.path.mapNotNull { nodeId ->
+                            graph.nodeById(nodeId)?.let { GeoPoint(it.latitude, it.longitude) }
+                        }
+                        if (routePoints.size >= 2) {
+                            val outerBorder = Polyline().apply {
+                                setPoints(routePoints)
+                                outlinePaint.color = android.graphics.Color.parseColor("#00231C")
+                                outlinePaint.strokeWidth = 22f
+                                outlinePaint.strokeCap = Paint.Cap.ROUND
+                                outlinePaint.strokeJoin = Paint.Join.ROUND
+                            }
+                            dynamicOverlays.add(outerBorder)
+                            mapView.overlays.add(outerBorder)
+
+                            val isAccessible = result.edges.isEmpty() || result.edges.all { it.wheelchairAccessible }
+
+                            val midGlow = Polyline().apply {
+                                setPoints(routePoints)
+                                outlinePaint.color = android.graphics.Color.parseColor(
+                                    if (isAccessible) "#00E5FF" else "#FFB300"
+                                )
+                                outlinePaint.strokeWidth = 16f
+                                outlinePaint.strokeCap = Paint.Cap.ROUND
+                                outlinePaint.strokeJoin = Paint.Join.ROUND
+                            }
+                            dynamicOverlays.add(midGlow)
+                            mapView.overlays.add(midGlow)
+
+                            val coreLine = Polyline().apply {
+                                setPoints(routePoints)
+                                outlinePaint.color = android.graphics.Color.parseColor(
+                                    if (isAccessible) "#00E676" else "#FF3D00"
+                                )
+                                outlinePaint.strokeWidth = 10f
+                                outlinePaint.strokeCap = Paint.Cap.ROUND
+                                outlinePaint.strokeJoin = Paint.Join.ROUND
+                            }
+                            dynamicOverlays.add(coreLine)
+                            mapView.overlays.add(coreLine)
+
+                            CampusLocationHelper.getBestLastKnownLocation(context)?.let { gpsLoc ->
+                                val distToStart = haversineDistance(
+                                    gpsLoc.latitude, gpsLoc.longitude,
+                                    routePoints.first().latitude, routePoints.first().longitude
+                                )
+                                if (distToStart in 8.0..CampusLocationHelper.MAX_CAMPUS_RADIUS_METERS) {
+                                    val walkInLine = Polyline().apply {
+                                        setPoints(listOf(GeoPoint(gpsLoc.latitude, gpsLoc.longitude), routePoints.first()))
+                                        outlinePaint.color = android.graphics.Color.parseColor("#2979FF")
+                                        outlinePaint.strokeWidth = 10f
+                                        outlinePaint.strokeCap = Paint.Cap.ROUND
+                                        outlinePaint.pathEffect = DashPathEffect(floatArrayOf(20f, 16f), 0f)
+                                    }
+                                    dynamicOverlays.add(walkInLine)
+                                    mapView.overlays.add(walkInLine)
+                                }
+                            }
+
+                            for (i in 1 until routePoints.size - 1) {
+                                val wpMarker = Marker(mapView).apply {
+                                    position = routePoints[i]
+                                    ContextCompat.getDrawable(context, R.drawable.ic_route_waypoint)?.let { icon = it }
+                                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                                    val wpNode = graph.nodeById(result.path[i])
+                                    title = wpNode?.name ?: "Step $i"
+                                    snippet = "Campus Turn • Accessible Walkway"
+                                }
+                                dynamicOverlays.add(wpMarker)
+                                mapView.overlays.add(wpMarker)
+                            }
+
+                            val startMarker = Marker(mapView).apply {
+                                position = routePoints.first()
+                                ContextCompat.getDrawable(context, R.drawable.ic_route_start)?.let { icon = it }
+                                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                                val startNode = graph.nodeById(result.path.first())
+                                title = "🟢 START: ${startNode?.name ?: "Origin"}"
+                                snippet = startNode?.description ?: "Starting Point"
+                            }
+                            dynamicOverlays.add(startMarker)
+                            mapView.overlays.add(startMarker)
+
+                            val destMarker = Marker(mapView).apply {
+                                position = routePoints.last()
+                                ContextCompat.getDrawable(context, R.drawable.ic_route_end)?.let { icon = it }
+                                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                                val destNode = graph.nodeById(result.path.last())
+                                title = "🏁 DESTINATION: ${destNode?.name ?: "Target"}"
+                                snippet = destNode?.description ?: "Destination"
+                            }
+                            dynamicOverlays.add(destMarker)
+                            mapView.overlays.add(destMarker)
+
+                            if (lastZoomedRouteKey != routeKey) {
+                                lastZoomedRouteKey = routeKey
+                                mapView.post {
+                                    try {
+                                        val bBox = BoundingBox.fromGeoPoints(routePoints)
+                                        mapView.zoomToBoundingBox(bBox.increaseByScale(1.35f), true, 130)
+                                    } catch (_: Exception) {
+                                        val midLat = routePoints.map { it.latitude }.average()
+                                        val midLon = routePoints.map { it.longitude }.average()
+                                        mapView.controller.setCenter(GeoPoint(midLat, midLon))
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (myLocOverlay != null) {
+                        mapView.overlays.add(myLocOverlay)
+                    }
                     mapView.invalidate()
                 }
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Top bar + optional GPS feedback banner
+        // Top bar + optional GPS / offline / arrival banner
         Column(modifier = Modifier.fillMaxWidth()) {
             Row(
                 modifier = Modifier
@@ -333,18 +480,24 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     .padding(horizontal = 8.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = { navController.popBackStack() }) {
+                IconButton(
+                    onClick = { navController.popBackStack() },
+                    modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                ) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (fromId.isEmpty()) "LPU Campus Map" else "Accessible Campus Route",
+                        text = if (activeFromId.isEmpty()) "LPU Campus Map" else "Accessible Campus Route",
                         color = Color.White,
                         fontWeight = FontWeight.Bold,
                         fontSize = 17.sp
                     )
                     Text(
-                        text = if (isSatelliteView) "🛰️ Satellite View (Google Hybrid)" else "🗺️ Vector Street Map",
+                        text = buildString {
+                            append(if (isSatelliteView) "🛰️ Satellite Hybrid" else "🗺️ Street Map")
+                            if (activeHazards.isNotEmpty()) append(" • ⚠️ ${activeHazards.size} hazards")
+                        },
                         color = if (isSatelliteView) Color(0xFF00E676) else Color(0xFFB0BEC5),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Medium
@@ -357,7 +510,12 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     color = if (isSatelliteView) Color(0xFF00E676) else Color.White.copy(alpha = 0.22f),
                     modifier = Modifier
                         .padding(end = 4.dp)
-                        .clickable { isSatelliteView = !isSatelliteView }
+                        .heightIn(min = 38.dp)
+                        .semantics { contentDescription = "Toggle satellite or street map" }
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            isSatelliteView = !isSatelliteView
+                        }
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -388,7 +546,7 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                         }
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
@@ -399,16 +557,16 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                         )
                         Icon(
                             Icons.Default.Close,
-                            contentDescription = "Dismiss",
+                            contentDescription = "Dismiss notification",
                             tint = Color(0xFF9FB3C8),
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                     }
                 }
             }
         }
 
-        // Right-side Map Controls: My Location (Blue Dot / Follow) + Center LPU
+        // Right-side Map Controls: My Location, Center LPU, Offline Campus Tiles
         Column(
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -418,6 +576,7 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
         ) {
             SmallFloatingActionButton(
                 onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                     if (!CampusLocationHelper.hasLocationPermission(context)) {
                         locationPermissionLauncher.launch(
                             arrayOf(
@@ -461,6 +620,7 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                         locationNotice = "📡 Waiting for GPS lock... (On emulator: Extended Controls → Location)"
                     }
                 },
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
                 containerColor = if (followUser) Color(0xFF00E676) else Color.White,
                 contentColor = if (followUser) Color(0xFF003300) else Color(0xFF1565C0)
             ) {
@@ -469,16 +629,71 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
 
             SmallFloatingActionButton(
                 onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                     followUser = false
                     myLocationOverlayRef?.disableFollowLocation()
                     mapViewRef?.controller?.animateTo(LPU_CENTER)
                     mapViewRef?.controller?.setZoom(17.5)
                     locationNotice = null
                 },
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
                 containerColor = Color.White,
                 contentColor = Color(0xFF1565C0)
             ) {
                 Icon(Icons.Default.CenterFocusStrong, contentDescription = "Center on LPU Campus")
+            }
+
+            // Offline Campus Map Tiles Cache Manager FAB
+            SmallFloatingActionButton(
+                onClick = {
+                    val mv = mapViewRef
+                    if (mv != null && !isDownloadingTiles) {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        isDownloadingTiles = true
+                        locationNotice = "⬇️ Caching LPU Campus map tiles (Zoom 15–18) for offline use..."
+                        val cacheManager = CacheManager(mv)
+                        val campusBounds = BoundingBox(31.264, 75.714, 31.244, 75.695)
+                        cacheManager.downloadAreaAsyncNoUI(
+                            context,
+                            campusBounds,
+                            15,
+                            18,
+                            object : CacheManager.CacheManagerCallback {
+                                override fun onTaskComplete() {
+                                    isDownloadingTiles = false
+                                    locationNotice = "✅ Offline campus map tiles cached (Zoom 15–18)!"
+                                    voice.speak("Offline campus map tiles downloaded.", settings.voiceGuidance)
+                                }
+
+                                override fun onTaskFailed(errors: Int) {
+                                    isDownloadingTiles = false
+                                    locationNotice = if (errors > 0) {
+                                        "⚠️ Offline cache finished with $errors tile errors (check connection)."
+                                    } else {
+                                        "✅ Offline campus map tiles cached!"
+                                    }
+                                }
+
+                                override fun updateProgress(
+                                    progress: Int,
+                                    currentZoomLevel: Int,
+                                    zoomMin: Int,
+                                    zoomMax: Int
+                                ) {
+                                    locationNotice = "⬇️ Caching offline tiles: zoom $currentZoomLevel ($progress tiles)..."
+                                }
+
+                                override fun downloadStarted() {}
+                                override fun setPossibleTilesInArea(total: Int) {}
+                            }
+                        )
+                    }
+                },
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
+                containerColor = if (isDownloadingTiles) Color(0xFFFFD54F) else Color.White,
+                contentColor = Color(0xFF1565C0)
+            ) {
+                Icon(Icons.Default.Download, contentDescription = "Download Offline Campus Map Tiles")
             }
         }
 
@@ -488,8 +703,24 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                 modifier = Modifier.align(Alignment.BottomCenter),
                 result = routeResult,
                 graph = graph,
-                fromId = fromId,
+                fromId = activeFromId,
                 toId = toId,
+                stepFreeOnly = stepFreeOnly,
+                onToggleStepFree = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    stepFreeOnly = !stepFreeOnly
+                },
+                onSpeakRoute = {
+                    val fromName = graph.nodeById(activeFromId)?.name ?: activeFromId
+                    val toName = graph.nodeById(toId)?.name ?: toId
+                    val dist = routeResult.totalDistanceMeters.toInt()
+                    val mins = (dist / 80).coerceAtLeast(1)
+                    val mode = if (stepFreeOnly) "step-free" else "shortest"
+                    voice.speak(
+                        "Showing $mode route from $fromName to $toName, $dist meters, about $mins minutes.",
+                        true
+                    )
+                },
                 onDismiss = { showRouteInfo = false },
                 onBuildingInfo = { nodeId -> navController.navigate("building/$nodeId") }
             )
@@ -502,10 +733,25 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
             modifier = Modifier.align(Alignment.BottomCenter)
         ) {
             selectedNode?.let { node ->
+                val isFav = settings.isFavorite(node.id)
                 BuildingPictureCard(
                     node = node,
+                    isFavorite = isFav,
+                    onToggleFavorite = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        settings.toggleFavorite(node.id)
+                    },
+                    onSpeakSummary = {
+                        val rampText = if (node.hasRamp) "Ramp available" else "No ramp"
+                        val elevText = if (node.hasElevator) "Elevator available" else "${node.stairCount} stairs"
+                        voice.speak(
+                            "${node.name}. $rampText. $elevText. Accessibility score ${node.accessibilityScore} out of 10.",
+                            true
+                        )
+                    },
                     onDismiss = { selectedNode = null },
                     onNavigateTo = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         val gpsOrigin = CampusLocationHelper.nearestCampusNodeFromGps(
                             context, graph, myLocationOverlayRef?.lastFix
                         )
@@ -533,6 +779,9 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
 @Composable
 fun BuildingPictureCard(
     node: CampusNode,
+    isFavorite: Boolean,
+    onToggleFavorite: () -> Unit,
+    onSpeakSummary: () -> Unit,
     onDismiss: () -> Unit,
     onNavigateTo: () -> Unit,
     onFullDetails: () -> Unit
@@ -563,18 +812,17 @@ fun BuildingPictureCard(
             .navigationBarsPadding(),
         shape = RoundedCornerShape(20.dp),
         elevation = CardDefaults.cardElevation(10.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White)
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
         ) {
-            // Big Picture Banner
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(180.dp)
+                    .height(165.dp)
             ) {
                 if (imageResId != null) {
                     Image(
@@ -584,7 +832,6 @@ fun BuildingPictureCard(
                         modifier = Modifier.fillMaxSize()
                     )
                 } else {
-                    // Modern Styled Building Graphic Banner (Placeholder until user adds photo)
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -603,18 +850,18 @@ fun BuildingPictureCard(
                             Surface(
                                 shape = CircleShape,
                                 color = Color.White.copy(alpha = 0.2f),
-                                modifier = Modifier.size(68.dp)
+                                modifier = Modifier.size(64.dp)
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
                                     Icon(
                                         Icons.Default.Apartment,
                                         contentDescription = null,
                                         tint = Color.White,
-                                        modifier = Modifier.size(40.dp)
+                                        modifier = Modifier.size(36.dp)
                                     )
                                 }
                             }
-                            Spacer(Modifier.height(8.dp))
+                            Spacer(Modifier.height(6.dp))
                             Text(
                                 text = node.id,
                                 color = Color(0xFFFFD54F),
@@ -630,16 +877,52 @@ fun BuildingPictureCard(
                     }
                 }
 
-                // Close Button Top Right
-                IconButton(
-                    onClick = onDismiss,
+                // Top Right: Favorite + Speak + Close
+                Row(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
-                        .padding(8.dp)
-                        .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-                        .size(34.dp)
+                        .padding(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White, modifier = Modifier.size(18.dp))
+                    IconButton(
+                        onClick = onToggleFavorite,
+                        modifier = Modifier
+                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                            .size(40.dp)
+                    ) {
+                        Icon(
+                            if (isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
+                            contentDescription = if (isFavorite) "Remove favorite" else "Add favorite",
+                            tint = if (isFavorite) Color(0xFFFFD54F) else Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = onSpeakSummary,
+                        modifier = Modifier
+                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                            .size(40.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.VolumeUp,
+                            contentDescription = "Read building info aloud",
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                            .size(40.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Close",
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
 
                 // Accessibility Badge Top Left
@@ -664,7 +947,6 @@ fun BuildingPictureCard(
                 }
             }
 
-            // Building Details Body
             Column(modifier = Modifier.padding(16.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -675,16 +957,16 @@ fun BuildingPictureCard(
                         text = node.name,
                         fontSize = 18.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF212121),
+                        color = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.weight(1f)
                     )
                     Surface(
                         shape = RoundedCornerShape(12.dp),
-                        color = Color(0xFFE3F2FD)
+                        color = MaterialTheme.colorScheme.primaryContainer
                     ) {
                         Text(
                             text = "Score: ${node.accessibilityScore}/10",
-                            color = Color(0xFF1565C0),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -694,7 +976,6 @@ fun BuildingPictureCard(
 
                 Spacer(Modifier.height(10.dp))
 
-                // Accessibility Feature Chips
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -716,14 +997,13 @@ fun BuildingPictureCard(
                     Text(
                         text = node.description,
                         fontSize = 12.sp,
-                        color = Color(0xFF546E7A),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         lineHeight = 17.sp
                     )
                 }
 
                 Spacer(Modifier.height(14.dp))
 
-                // Action Buttons
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -732,24 +1012,23 @@ fun BuildingPictureCard(
                         onClick = onNavigateTo,
                         modifier = Modifier
                             .weight(1f)
-                            .height(46.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                            .heightIn(min = 48.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                         shape = RoundedCornerShape(10.dp)
                     ) {
-                        Icon(Icons.Default.Navigation, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("Route Here", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Route Here", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     }
 
                     OutlinedButton(
                         onClick = onFullDetails,
                         modifier = Modifier
                             .weight(1f)
-                            .height(46.dp),
-                        shape = RoundedCornerShape(10.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF1565C0))
+                            .heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(10.dp)
                     ) {
-                        Icon(Icons.Default.Info, contentDescription = null, tint = Color(0xFF1565C0), modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("Full Profile", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                     }
@@ -793,6 +1072,9 @@ fun RouteInfoPanel(
     graph: com.accessmap.app.routing.CampusGraph,
     fromId: String,
     toId: String,
+    stepFreeOnly: Boolean,
+    onToggleStepFree: () -> Unit,
+    onSpeakRoute: () -> Unit,
     onDismiss: () -> Unit,
     onBuildingInfo: (String) -> Unit
 ) {
@@ -807,13 +1089,16 @@ fun RouteInfoPanel(
     Card(
         modifier = modifier
             .fillMaxWidth()
-            .padding(12.dp),
+            .padding(12.dp)
+            .navigationBarsPadding(),
         shape = RoundedCornerShape(16.dp),
-        elevation = CardDefaults.cardElevation(8.dp)
+        elevation = CardDefaults.cardElevation(8.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(
             modifier = Modifier
                 .padding(16.dp)
+                .heightIn(max = 260.dp)
                 .verticalScroll(rememberScrollState())
         ) {
             Row(
@@ -822,20 +1107,50 @@ fun RouteInfoPanel(
                 verticalAlignment = Alignment.Top
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Route Found ✅", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color(0xFF1565C0))
+                    Text(
+                        if (stepFreeOnly) "Step-Free Route ✅" else "Shortest Route ⚡",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                     Text(
                         "${fromNode?.name ?: fromId} → ${toNode?.name ?: toId}",
                         fontSize = 12.sp,
-                        color = Color.Gray
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (result.avoidedHazards) {
+                        Text(
+                            "🛡️ Routing around active campus hazards",
+                            fontSize = 11.sp,
+                            color = Color(0xFF2E7D32),
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+                IconButton(onClick = onSpeakRoute) {
+                    Icon(
+                        Icons.Default.VolumeUp,
+                        contentDescription = "Speak route summary",
+                        tint = MaterialTheme.colorScheme.primary
                     )
                 }
                 TextButton(onClick = onDismiss) { Text("✕") }
             }
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Spacer(Modifier.height(6.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 InfoChip("📍 $distanceText")
                 InfoChip("🚶 ~$walkMinutes min")
                 InfoChip("${result.path.size} stops")
+                FilterChip(
+                    selected = stepFreeOnly,
+                    onClick = onToggleStepFree,
+                    label = {
+                        Text(if (stepFreeOnly) "♿ Step-free" else "⚡ Shortest", fontSize = 11.sp)
+                    }
+                )
             }
             Spacer(Modifier.height(8.dp))
             Text("Stops:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
@@ -847,18 +1162,28 @@ fun RouteInfoPanel(
                         .padding(vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("${i + 1}.", modifier = Modifier.width(24.dp), fontSize = 12.sp, color = Color.Gray)
-                    Text(node?.name ?: nodeId, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                    Text(
+                        "${i + 1}.",
+                        modifier = Modifier.width(24.dp),
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        node?.name ?: nodeId,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
                     if (node?.isBuilding == true) {
                         IconButton(
                             onClick = { onBuildingInfo(nodeId) },
-                            modifier = Modifier.size(28.dp)
+                            modifier = Modifier.size(32.dp)
                         ) {
                             Icon(
                                 Icons.Default.Info,
-                                contentDescription = null,
+                                contentDescription = "View building info",
                                 modifier = Modifier.size(16.dp),
-                                tint = Color(0xFF1565C0)
+                                tint = MaterialTheme.colorScheme.primary
                             )
                         }
                     }
@@ -872,14 +1197,14 @@ fun RouteInfoPanel(
 fun InfoChip(text: String) {
     Surface(
         shape = RoundedCornerShape(20.dp),
-        color = Color(0xFFE3F2FD)
+        color = MaterialTheme.colorScheme.primaryContainer
     ) {
         Text(
             text,
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
             fontSize = 12.sp,
             fontWeight = FontWeight.Medium,
-            color = Color(0xFF1565C0)
+            color = MaterialTheme.colorScheme.onPrimaryContainer
         )
     }
 }

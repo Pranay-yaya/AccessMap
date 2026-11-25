@@ -4,7 +4,15 @@ import android.content.Context
 import androidx.room.*
 import kotlinx.coroutines.flow.Flow
 
-enum class HazardType { CONSTRUCTION, LOCKED_GATE, BROKEN_ELEVATOR, BLOCKED_PATH, UNEVEN_PAVEMENT }
+enum class HazardType {
+    CONSTRUCTION,
+    LOCKED_GATE,
+    BROKEN_ELEVATOR,
+    BLOCKED_PATH,
+    UNEVEN_PAVEMENT,
+    AI_CONFIRMED_STAIRS,
+    AI_CONFIRMED_OBSTACLE
+}
 
 @Entity(tableName = "hazards")
 data class HazardEntity(
@@ -14,13 +22,20 @@ data class HazardEntity(
     val type: HazardType,
     val description: String,
     val timestamp: Long,
-    val isResolved: Boolean = false
+    val isResolved: Boolean = false,
+    val nodeId: String = "",
+    val photoPath: String = "",
+    val confirmations: Int = 1,
+    val lastConfirmedAt: Long = timestamp
 )
 
 @Dao
 interface HazardDao {
-    @Query("SELECT * FROM hazards WHERE isResolved = 0 ORDER BY timestamp DESC")
-    fun getActiveHazards(): Flow<List<HazardEntity>>
+    @Query("SELECT * FROM hazards WHERE isResolved = 0 AND lastConfirmedAt >= :minTimestamp ORDER BY timestamp DESC")
+    fun getActiveHazards(minTimestamp: Long = 0L): Flow<List<HazardEntity>>
+
+    @Query("SELECT * FROM hazards WHERE isResolved = 0 AND lastConfirmedAt >= :minTimestamp ORDER BY timestamp DESC")
+    suspend fun getActiveHazardsOnce(minTimestamp: Long = 0L): List<HazardEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(hazard: HazardEntity): Long
@@ -31,6 +46,12 @@ interface HazardDao {
     @Query("UPDATE hazards SET isResolved = 1 WHERE id = :hazardId")
     suspend fun markResolved(hazardId: Long)
 
+    @Query("UPDATE hazards SET confirmations = confirmations + 1, lastConfirmedAt = :now WHERE id = :hazardId")
+    suspend fun confirmStillThere(hazardId: Long, now: Long)
+
+    @Query("DELETE FROM hazards WHERE isResolved = 0 AND lastConfirmedAt < :cutoff")
+    suspend fun deleteExpired(cutoff: Long)
+
     @Delete
     suspend fun delete(hazard: HazardEntity)
 }
@@ -40,15 +61,18 @@ class Converters {
     fun fromHazardType(type: HazardType): String = type.name
 
     @TypeConverter
-    fun toHazardType(value: String): HazardType = HazardType.valueOf(value)
+    fun toHazardType(value: String): HazardType =
+        runCatching { HazardType.valueOf(value) }.getOrDefault(HazardType.BLOCKED_PATH)
 }
 
-@Database(entities = [HazardEntity::class], version = 1, exportSchema = false)
+@Database(entities = [HazardEntity::class], version = 2, exportSchema = false)
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun hazardDao(): HazardDao
 
     companion object {
+        const val EXPIRY_MILLIS = 7L * 24 * 60 * 60 * 1000L // 7 days
+
         @Volatile private var INSTANCE: AppDatabase? = null
 
         fun getInstance(context: Context): AppDatabase =
@@ -57,7 +81,10 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     "accessmap.db"
-                ).build().also { INSTANCE = it }
+                )
+                    .fallbackToDestructiveMigration()
+                    .build()
+                    .also { INSTANCE = it }
             }
     }
 }

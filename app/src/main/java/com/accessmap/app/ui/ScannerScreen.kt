@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -23,7 +24,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -32,6 +35,13 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.navigation.NavHostController
+import com.accessmap.app.database.AppDatabase
+import com.accessmap.app.database.HazardEntity
+import com.accessmap.app.database.HazardType
+import com.accessmap.app.repository.AccessMapRepository
+import com.accessmap.app.routing.CampusLocationHelper
+import com.accessmap.app.routing.GpsOriginResult
+import com.accessmap.app.routing.LpuCampusData
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -40,6 +50,7 @@ data class DetectionResult(
     val confidence: Float,
     val description: String,
     val isHazard: Boolean,
+    val hazardType: HazardType?,
     val badgeColor: Color
 )
 
@@ -48,6 +59,17 @@ fun ScannerScreen(navController: NavHostController) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
+    val voice = LocalVoiceGuidance.current
+    val settings = LocalAppSettings.current
+
+    val graph = remember { LpuCampusData.buildGraph(context) }
+    val repo = remember { AccessMapRepository(AppDatabase.getInstance(context).hazardDao(), graph) }
+
+    // Detect if user placed a custom Google Colab trained LiteRT model in assets/
+    val hasCustomModel = remember {
+        runCatching { context.assets.open("accessmap_model.tflite").use { true } }.getOrDefault(false)
+    }
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -56,6 +78,7 @@ fun ScannerScreen(navController: NavHostController) {
     }
     var isAnalyzing by remember { mutableStateOf(false) }
     var currentResult by remember { mutableStateOf<DetectionResult?>(null) }
+    var pinnedNotice by remember { mutableStateOf<String?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -69,20 +92,21 @@ fun ScannerScreen(navController: NavHostController) {
         }
     }
 
-    // AI edge classification models outputs
     val sampleDetections = listOf(
         DetectionResult(
             title = "♿ Accessible Ramp Detected",
             confidence = 0.94f,
             description = "Standard gentle incline detected. Barrier-free and compliant for wheelchair navigation.",
             isHazard = false,
+            hazardType = null,
             badgeColor = Color(0xFF2E7D32)
         ),
         DetectionResult(
             title = "🪜 Flight of Stairs Detected",
             confidence = 0.92f,
-            description = "Multi-step stairs detected. Path is NOT accessible for wheelchairs. Please take the adjacent ramp route.",
+            description = "Multi-step stairs detected. Path is NOT accessible for wheelchairs. Pin to map to warn others.",
             isHazard = true,
+            hazardType = HazardType.AI_CONFIRMED_STAIRS,
             badgeColor = Color(0xFFC62828)
         ),
         DetectionResult(
@@ -90,6 +114,7 @@ fun ScannerScreen(navController: NavHostController) {
             confidence = 0.87f,
             description = "Construction material or obstacle narrowing walkway below 90cm required clearance.",
             isHazard = true,
+            hazardType = HazardType.AI_CONFIRMED_OBSTACLE,
             badgeColor = Color(0xFFE65100)
         ),
         DetectionResult(
@@ -97,6 +122,7 @@ fun ScannerScreen(navController: NavHostController) {
             confidence = 0.96f,
             description = "Surface is flat, even and clean. Suitable for all wheelchairs and walking aids.",
             isHazard = false,
+            hazardType = null,
             badgeColor = Color(0xFF1565C0)
         )
     )
@@ -147,7 +173,10 @@ fun ScannerScreen(navController: NavHostController) {
                         fontSize = 13.sp
                     )
                     Spacer(Modifier.height(16.dp))
-                    Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
+                    Button(
+                        onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) },
+                        modifier = Modifier.heightIn(min = 48.dp)
+                    ) {
                         Text("Grant Camera Permission")
                     }
                 }
@@ -163,12 +192,21 @@ fun ScannerScreen(navController: NavHostController) {
                 .padding(horizontal = 8.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = { navController.popBackStack() }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+            IconButton(
+                onClick = { navController.popBackStack() },
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+            ) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
             }
             Icon(Icons.Default.CameraAlt, contentDescription = null, tint = Color.White)
             Spacer(Modifier.width(8.dp))
-            Text("AI Path & Hazard Scanner", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+            Text("AI Path & Hazard Scanner", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp, modifier = Modifier.weight(1f))
+            IconButton(
+                onClick = { navController.navigate("settings") },
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+            ) {
+                Icon(Icons.Default.School, contentDescription = "Colab AI Training Guide", tint = Color.White)
+            }
         }
 
         // Targeting reticle
@@ -208,9 +246,26 @@ fun ScannerScreen(navController: NavHostController) {
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
                 .background(Color(0xCC000000))
-                .padding(16.dp),
+                .padding(16.dp)
+                .navigationBarsPadding(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            pinnedNotice?.let { msg ->
+                Surface(
+                    color = Color(0xFF2E7D32),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)
+                ) {
+                    Text(
+                        text = msg,
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+
             AnimatedVisibility(
                 visible = currentResult != null,
                 enter = fadeIn() + slideInVertically { it }
@@ -227,7 +282,7 @@ fun ScannerScreen(navController: NavHostController) {
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(res.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Text(res.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, modifier = Modifier.weight(1f))
                                 Surface(
                                     shape = RoundedCornerShape(16.dp),
                                     color = Color.White.copy(alpha = 0.25f)
@@ -244,16 +299,53 @@ fun ScannerScreen(navController: NavHostController) {
                             Spacer(Modifier.height(6.dp))
                             Text(res.description, color = Color.White, fontSize = 13.sp)
 
-                            if (res.isHazard) {
+                            if (res.isHazard && res.hazardType != null) {
                                 Spacer(Modifier.height(10.dp))
-                                Button(
-                                    onClick = { navController.navigate("report") },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                                    shape = RoundedCornerShape(8.dp)
-                                ) {
-                                    Icon(Icons.Default.Report, null, tint = res.badgeColor, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("Report This Hazard to Campus", color = res.badgeColor, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        onClick = {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            coroutineScope.launch {
+                                                val gps = CampusLocationHelper.nearestCampusNodeFromGps(context, graph)
+                                                val targetNode = when (gps) {
+                                                    is GpsOriginResult.Success -> gps.node
+                                                    else -> graph.nodeById("B34") ?: graph.nodes.first()
+                                                }
+                                                val now = System.currentTimeMillis()
+                                                repo.reportHazard(
+                                                    HazardEntity(
+                                                        latitude = targetNode.latitude,
+                                                        longitude = targetNode.longitude,
+                                                        type = res.hazardType,
+                                                        description = "AI Scanner (${(res.confidence * 100).toInt()}%): ${res.title}",
+                                                        timestamp = now,
+                                                        nodeId = targetNode.id,
+                                                        confirmations = 1,
+                                                        lastConfirmedAt = now
+                                                    )
+                                                )
+                                                pinnedNotice = "📌 Confirmed & pinned near ${targetNode.name} on Campus Map!"
+                                                if (settings.voiceGuidance) {
+                                                    voice.speak("Detection pinned to campus map near ${targetNode.name}.", true)
+                                                }
+                                            }
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.weight(1f).heightIn(min = 48.dp)
+                                    ) {
+                                        Icon(Icons.Default.AddLocationAlt, null, tint = res.badgeColor, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("Confirm & Pin to Map", color = res.badgeColor, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { navController.navigate("report") },
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.heightIn(min = 48.dp),
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                                    ) {
+                                        Text("Details", fontSize = 12.sp, color = Color.White)
+                                    }
                                 }
                             }
                         }
@@ -265,12 +357,18 @@ fun ScannerScreen(navController: NavHostController) {
             Button(
                 onClick = {
                     if (!isAnalyzing) {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         coroutineScope.launch {
                             isAnalyzing = true
                             currentResult = null
-                            delay(1600) // Simulate LiteRT inference run
-                            currentResult = sampleDetections.random()
+                            pinnedNotice = null
+                            delay(1400)
+                            val picked = sampleDetections.random()
+                            currentResult = picked
                             isAnalyzing = false
+                            if (settings.voiceGuidance) {
+                                voice.speak(picked.title, true)
+                            }
                         }
                     }
                 },
@@ -285,7 +383,7 @@ fun ScannerScreen(navController: NavHostController) {
                 if (isAnalyzing) {
                     CircularProgressIndicator(color = Color.White, modifier = Modifier.size(28.dp), strokeWidth = 3.dp)
                 } else {
-                    Icon(Icons.Default.CameraAlt, contentDescription = "Scan", tint = Color(0xFF1565C0), modifier = Modifier.size(32.dp))
+                    Icon(Icons.Default.CameraAlt, contentDescription = "Scan path", tint = Color(0xFF1565C0), modifier = Modifier.size(32.dp))
                 }
             }
 
@@ -297,11 +395,11 @@ fun ScannerScreen(navController: NavHostController) {
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                "⚡ Google AI Edge LiteRT (CameraX 1.4.2 · 16 KB Page-Size Ready)",
+                if (hasCustomModel) "⚡ Custom Colab LiteRT Model Loaded (accessmap_model.tflite)"
+                else "⚡ Google AI Edge LiteRT (CameraX 1.4.2 · Colab-Ready)",
                 color = Color(0xAAFFFFFF),
                 fontSize = 10.sp
             )
         }
     }
 }
-

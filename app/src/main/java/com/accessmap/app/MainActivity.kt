@@ -7,7 +7,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -31,97 +34,134 @@ class MainActivity : ComponentActivity() {
         Configuration.getInstance().userAgentValue = packageName
 
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier) {
-                    val navController = rememberNavController()
-                    val context = LocalContext.current
+            val context = LocalContext.current
+            val settings = remember { AppSettingsState(context) }
+            val voice = remember { VoiceGuidanceHelper(context) }
 
-                    // Prompt for location permissions on launch for live GPS marker & proximity
-                    var locationPermissionGranted by remember {
-                        mutableStateOf(
-                            ContextCompat.checkSelfPermission(
-                                context,
-                                Manifest.permission.ACCESS_FINE_LOCATION
-                            ) == PackageManager.PERMISSION_GRANTED
-                        )
-                    }
+            DisposableEffect(Unit) {
+                onDispose { voice.shutdown() }
+            }
 
-                    val locationLauncher = rememberLauncherForActivityResult(
-                        ActivityResultContracts.RequestMultiplePermissions()
-                    ) { permissions ->
-                        locationPermissionGranted =
-                            permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-                    }
+            CompositionLocalProvider(
+                LocalAppSettings provides settings,
+                LocalVoiceGuidance provides voice
+            ) {
+                AccessMapTheme(settings = settings) {
+                    Surface(modifier = Modifier) {
+                        val navController = rememberNavController()
 
-                    LaunchedEffect(Unit) {
-                        if (!locationPermissionGranted) {
-                            locationLauncher.launch(
-                                arrayOf(
-                                    Manifest.permission.ACCESS_FINE_LOCATION,
-                                    Manifest.permission.ACCESS_COARSE_LOCATION
+                        // Prompt for location permissions on launch for live GPS marker & proximity
+                        var locationPermissionGranted by remember {
+                            mutableStateOf(
+                                ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.ACCESS_FINE_LOCATION
+                                ) == PackageManager.PERMISSION_GRANTED
+                            )
+                        }
+
+                        val locationLauncher = rememberLauncherForActivityResult(
+                            ActivityResultContracts.RequestMultiplePermissions()
+                        ) { permissions ->
+                            locationPermissionGranted =
+                                permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+                        }
+
+                        LaunchedEffect(Unit) {
+                            if (!locationPermissionGranted) {
+                                locationLauncher.launch(
+                                    arrayOf(
+                                        Manifest.permission.ACCESS_FINE_LOCATION,
+                                        Manifest.permission.ACCESS_COARSE_LOCATION
+                                    )
                                 )
-                            )
-                        }
-                    }
-
-                    NavHost(navController = navController, startDestination = "welcome") {
-                        composable("welcome") {
-                            WelcomeScreen(navController)
+                            }
                         }
 
-                        composable("home") {
-                            HomeScreen(navController)
-                        }
+                        NavHost(
+                            navController = navController,
+                            startDestination = "welcome",
+                            enterTransition = {
+                                slideIntoContainer(
+                                    AnimatedContentTransitionScope.SlideDirection.Left,
+                                    tween(260)
+                                ) + fadeIn(tween(220))
+                            },
+                            exitTransition = {
+                                fadeOut(tween(180))
+                            },
+                            popEnterTransition = {
+                                slideIntoContainer(
+                                    AnimatedContentTransitionScope.SlideDirection.Right,
+                                    tween(260)
+                                ) + fadeIn(tween(220))
+                            },
+                            popExitTransition = {
+                                fadeOut(tween(180))
+                            }
+                        ) {
+                            composable("welcome") {
+                                WelcomeScreen(navController)
+                            }
 
-                        composable("map") {
-                            MapScreen(navController, "", "")
-                        }
+                            composable("home") {
+                                HomeScreen(navController)
+                            }
 
-                        composable(
-                            "map/{fromId}/{toId}",
-                            arguments = listOf(
-                                navArgument("fromId") { type = NavType.StringType },
-                                navArgument("toId") { type = NavType.StringType }
-                            )
-                        ) { backStackEntry ->
-                            val fromId = backStackEntry.arguments?.getString("fromId") ?: ""
-                            val toId = backStackEntry.arguments?.getString("toId") ?: ""
-                            MapScreen(navController, fromId, toId)
-                        }
+                            composable("settings") {
+                                SettingsAboutScreen(navController)
+                            }
 
-                        composable(
-                            "building/{buildingId}",
-                            arguments = listOf(
-                                navArgument("buildingId") { type = NavType.StringType }
-                            )
-                        ) { backStackEntry ->
-                            val buildingId = backStackEntry.arguments?.getString("buildingId") ?: ""
-                            BuildingInfoScreen(navController, buildingId)
-                        }
+                            composable("map") {
+                                MapScreen(navController, "", "")
+                            }
 
-                        composable("report") {
-                            ReportHazardScreen(navController)
-                        }
+                            composable(
+                                "map/{fromId}/{toId}",
+                                arguments = listOf(
+                                    navArgument("fromId") { type = NavType.StringType },
+                                    navArgument("toId") { type = NavType.StringType }
+                                )
+                            ) { backStackEntry ->
+                                val fromId = backStackEntry.arguments?.getString("fromId") ?: ""
+                                val toId = backStackEntry.arguments?.getString("toId") ?: ""
+                                MapScreen(navController, fromId, toId)
+                            }
 
-                        composable("scanner") {
-                            ScannerScreen(navController)
-                        }
+                            composable(
+                                "building/{buildingId}",
+                                arguments = listOf(
+                                    navArgument("buildingId") { type = NavType.StringType }
+                                )
+                            ) { backStackEntry ->
+                                val buildingId = backStackEntry.arguments?.getString("buildingId") ?: ""
+                                BuildingInfoScreen(navController, buildingId)
+                            }
 
-                        composable("navigate") {
-                            NavigationScreen(navController)
-                        }
+                            composable("report") {
+                                ReportHazardScreen(navController)
+                            }
 
-                        composable(
-                            "navigate/{fromId}/{toId}",
-                            arguments = listOf(
-                                navArgument("fromId") { type = NavType.StringType; defaultValue = "" },
-                                navArgument("toId") { type = NavType.StringType; defaultValue = "" }
-                            )
-                        ) { backStackEntry ->
-                            val fromId = backStackEntry.arguments?.getString("fromId") ?: ""
-                            val toId = backStackEntry.arguments?.getString("toId") ?: ""
-                            NavigationScreen(navController, fromId, toId)
+                            composable("scanner") {
+                                ScannerScreen(navController)
+                            }
+
+                            composable("navigate") {
+                                NavigationScreen(navController)
+                            }
+
+                            composable(
+                                "navigate/{fromId}/{toId}",
+                                arguments = listOf(
+                                    navArgument("fromId") { type = NavType.StringType; defaultValue = "" },
+                                    navArgument("toId") { type = NavType.StringType; defaultValue = "" }
+                                )
+                            ) { backStackEntry ->
+                                val fromId = backStackEntry.arguments?.getString("fromId") ?: ""
+                                val toId = backStackEntry.arguments?.getString("toId") ?: ""
+                                NavigationScreen(navController, fromId, toId)
+                            }
                         }
                     }
                 }

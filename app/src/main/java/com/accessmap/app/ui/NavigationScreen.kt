@@ -7,20 +7,27 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.DirectionsRun
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
+import com.accessmap.app.database.AppDatabase
+import com.accessmap.app.repository.AccessMapRepository
 import com.accessmap.app.routing.AccessibilityRouter
 import com.accessmap.app.routing.LpuCampusData
 import com.accessmap.app.routing.RouteResult
+import com.accessmap.app.routing.haversineDistance
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -30,9 +37,25 @@ fun NavigationScreen(
     initialToId: String = ""
 ) {
     val context = LocalContext.current
+    val settings = LocalAppSettings.current
+    val voice = LocalVoiceGuidance.current
+    val haptic = LocalHapticFeedback.current
+
     val graph = remember { LpuCampusData.buildGraph(context) }
     val router = remember { AccessibilityRouter(graph) }
+    val repo = remember { AccessMapRepository(AppDatabase.getInstance(context).hazardDao(), graph) }
+    val activeHazards by repo.activeHazards().collectAsState(initial = emptyList())
     val allNodes = remember { graph.nodes }
+
+    // Map active Room hazards to their nearest campus node so Dijkstra avoids blocked paths
+    val blockedNodeIds = remember(activeHazards) {
+        activeHazards.mapNotNull { h ->
+            if (h.nodeId.isNotEmpty()) h.nodeId
+            else graph.nodes.minByOrNull { n ->
+                haversineDistance(h.latitude, h.longitude, n.latitude, n.longitude)
+            }?.id
+        }.toSet()
+    }
 
     var fromExpanded by remember { mutableStateOf(false) }
     var toExpanded by remember { mutableStateOf(false) }
@@ -53,43 +76,66 @@ fun NavigationScreen(
         routeResult = null
         if (selectedFromId.isEmpty() || selectedToId.isEmpty() || selectedFromId == selectedToId) return
         val result = if (accessibleOnly) {
-            router.findAccessibleRoute(selectedFromId, selectedToId)
+            router.findAccessibleRoute(selectedFromId, selectedToId, blockedNodeIds)
         } else {
-            router.findNormalRoute(selectedFromId, selectedToId)
+            router.findNormalRoute(selectedFromId, selectedToId, blockedNodeIds)
         }
         if (result == null) {
             noRouteFound = true
+            if (settings.voiceGuidance) {
+                voice.speak("No step-free route found. You can toggle off step-free only to see the shortest path.", true)
+            }
         } else {
             routeResult = result
+            val destName = graph.nodeById(selectedToId)?.name ?: selectedToId
+            val mins = (result.totalDistanceMeters / 75.0).toInt().coerceAtLeast(1)
+            if (settings.voiceGuidance) {
+                voice.speak(
+                    "Route ready to $destName. Distance ${result.totalDistanceMeters.toInt()} meters, about $mins minutes.",
+                    true
+                )
+            }
         }
     }
 
-    LaunchedEffect(initialFromId, initialToId) {
+    LaunchedEffect(initialFromId, initialToId, blockedNodeIds) {
         if (initialFromId.isNotEmpty() && initialToId.isNotEmpty() && initialFromId != initialToId) {
             computeRoute()
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().background(Color(0xFFF5F5F5))) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
         // Top bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFF1565C0))
+                .background(MaterialTheme.colorScheme.primary)
                 .statusBarsPadding()
-                .padding(horizontal = 8.dp, vertical = 12.dp),
+                .padding(horizontal = 8.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = { navController.popBackStack() }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+            IconButton(
+                onClick = { navController.popBackStack() },
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+            ) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = MaterialTheme.colorScheme.onPrimary)
             }
-            Icon(Icons.Default.Navigation, contentDescription = null, tint = Color.White)
+            Icon(Icons.Default.Navigation, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimary)
             Spacer(Modifier.width(8.dp))
-            Text("Accessible Route Planner", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Text(
+                "Accessible Route Planner",
+                color = MaterialTheme.colorScheme.onPrimary,
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp
+            )
         }
 
         LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(16.dp),
+            modifier = Modifier.fillMaxSize().padding(16.dp).navigationBarsPadding(),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
@@ -112,6 +158,7 @@ fun NavigationScreen(
                             UseMyGpsChip(
                                 graph = graph,
                                 onNodeResolved = { nodeId, msg ->
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     selectedFromId = nodeId
                                     gpsStatusMessage = msg
                                 },
@@ -128,7 +175,7 @@ fun NavigationScreen(
                                 onValueChange = {},
                                 readOnly = true,
                                 modifier = Modifier.fillMaxWidth().menuAnchor(),
-                                leadingIcon = { Icon(Icons.Default.TripOrigin, null, tint = Color(0xFF1565C0)) },
+                                leadingIcon = { Icon(Icons.Default.TripOrigin, null, tint = MaterialTheme.colorScheme.primary) },
                                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = fromExpanded) },
                                 colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors()
                             )
@@ -169,12 +216,16 @@ fun NavigationScreen(
 
                         // Swap Button
                         Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                            IconButton(onClick = {
-                                val temp = selectedFromId
-                                selectedFromId = selectedToId
-                                selectedToId = temp
-                            }) {
-                                Icon(Icons.Default.SwapVert, "Swap points", tint = Color(0xFF1565C0))
+                            IconButton(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    val temp = selectedFromId
+                                    selectedFromId = selectedToId
+                                    selectedToId = temp
+                                },
+                                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                            ) {
+                                Icon(Icons.Default.SwapVert, "Swap points", tint = MaterialTheme.colorScheme.primary)
                             }
                         }
 
@@ -198,10 +249,11 @@ fun NavigationScreen(
                                 onDismissRequest = { toExpanded = false }
                             ) {
                                 allNodes.forEach { node ->
+                                    val star = if (settings.isFavorite(node.id)) "⭐ " else ""
                                     DropdownMenuItem(
                                         text = {
                                             Column {
-                                                Text(node.name, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                                Text("$star${node.name}", fontSize = 13.sp, fontWeight = FontWeight.Medium)
                                                 Text(
                                                     if (node.hasRamp) "♿ Ramp available" else "⚠️ Stairs without ramp",
                                                     fontSize = 11.sp,
@@ -220,32 +272,49 @@ fun NavigationScreen(
 
                         Spacer(Modifier.height(10.dp))
 
-                        // Accessible Only Toggle
+                        // Step-free vs Shortest Toggle
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Switch(
                                 checked = accessibleOnly,
-                                onCheckedChange = { accessibleOnly = it },
-                                colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFF1565C0))
+                                onCheckedChange = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    accessibleOnly = it
+                                    if (selectedFromId.isNotEmpty() && selectedToId.isNotEmpty()) computeRoute()
+                                },
+                                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
                             )
                             Spacer(Modifier.width(10.dp))
                             Column {
-                                Text("Wheelchair accessible route only", fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                                Text("Stairs are completely bypassed; avoids steep slopes", fontSize = 11.sp, color = Color.Gray)
+                                Text(
+                                    if (accessibleOnly) "Step-free only (wheelchair safe)" else "Shortest route (may include stairs)",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    if (accessibleOnly) "Avoids stairs, steep slopes & active hazards" else "Minimizes total walking distance",
+                                    fontSize = 11.sp,
+                                    color = Color.Gray
+                                )
                             }
                         }
 
                         Spacer(Modifier.height(12.dp))
 
                         Button(
-                            onClick = { computeRoute() },
-                            modifier = Modifier.fillMaxWidth(),
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                computeRoute()
+                            },
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                             enabled = selectedFromId.isNotEmpty() && selectedToId.isNotEmpty() && selectedFromId != selectedToId,
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
                             shape = RoundedCornerShape(10.dp)
                         ) {
-                            Icon(Icons.Default.DirectionsRun, null, tint = Color.White)
+                            Icon(Icons.AutoMirrored.Filled.DirectionsRun, null)
                             Spacer(Modifier.width(8.dp))
-                            Text("Find Accessible Route", color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(
+                                if (accessibleOnly) "Find Step-Free Route" else "Find Shortest Route",
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
@@ -263,9 +332,9 @@ fun NavigationScreen(
                             Icon(Icons.Default.Warning, null, tint = Color(0xFFC62828), modifier = Modifier.size(32.dp))
                             Spacer(Modifier.width(12.dp))
                             Column {
-                                Text("No Accessible Route Found", fontWeight = FontWeight.Bold, color = Color(0xFFC62828))
+                                Text("No Step-Free Route Found", fontWeight = FontWeight.Bold, color = Color(0xFFC62828))
                                 Text(
-                                    "Stairs or obstacles block the accessible path. Toggle off 'Wheelchair accessible only' to see the standard path.",
+                                    "Stairs or obstacles block the accessible path. Switch to Shortest route to preview the standard path.",
                                     fontSize = 12.sp,
                                     color = Color(0xFF5D4037)
                                 )
@@ -274,7 +343,7 @@ fun NavigationScreen(
                                     accessibleOnly = false
                                     computeRoute()
                                 }) {
-                                    Text("Show path with stairs anyway →", color = Color(0xFF1565C0))
+                                    Text("Show shortest path anyway →", color = Color(0xFF1565C0))
                                 }
                             }
                         }
@@ -300,7 +369,31 @@ fun NavigationScreen(
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF2E7D32), modifier = Modifier.size(24.dp))
                                 Spacer(Modifier.width(8.dp))
-                                Text("Accessible Path Computed", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color(0xFF2E7D32))
+                                Text(
+                                    if (accessibleOnly) "Step-Free Path Computed" else "Shortest Path Computed",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 16.sp,
+                                    color = Color(0xFF2E7D32),
+                                    modifier = Modifier.weight(1f)
+                                )
+                                IconButton(
+                                    onClick = {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        val stepsText = result.path.mapIndexedNotNull { idx, id ->
+                                            val name = graph.nodeById(id)?.name ?: id
+                                            if (idx == 0) "Start at $name"
+                                            else if (idx == result.path.lastIndex) "Arrive at $name"
+                                            else "Continue past $name"
+                                        }.joinToString(". ")
+                                        voice.speak(stepsText, true)
+                                    },
+                                    modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                                ) {
+                                    Icon(Icons.Default.VolumeUp, contentDescription = "Speak turn-by-turn directions")
+                                }
+                            }
+                            if (result.avoidedHazards) {
+                                Text("🛡️ Hazard-aware: detoured around reported campus hazards", fontSize = 12.sp, color = Color(0xFF1565C0))
                             }
                             if (!accessibleOnly) {
                                 Text("⚠️ Includes stairs or uneven segments", fontSize = 12.sp, color = Color(0xFFE65100))
@@ -320,22 +413,22 @@ fun NavigationScreen(
 
                             Button(
                                 onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                     navController.navigate("map/$selectedFromId/$selectedToId")
                                 },
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                                 shape = RoundedCornerShape(10.dp)
                             ) {
-                                Icon(Icons.Default.Map, null, tint = Color.White)
+                                Icon(Icons.Default.Map, null)
                                 Spacer(Modifier.width(8.dp))
-                                Text("View on Campus Map", color = Color.White, fontWeight = FontWeight.Bold)
+                                Text("View & Track Live on Map", fontWeight = FontWeight.Bold)
                             }
                         }
                     }
                 }
 
                 item {
-                    Text("Turn-by-Turn Directions", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.DarkGray)
+                    Text("Turn-by-Turn Directions", fontWeight = FontWeight.Bold, fontSize = 15.sp)
                 }
 
                 itemsIndexed(result.path) { index, nodeId ->
@@ -344,65 +437,68 @@ fun NavigationScreen(
                     val isLast = index == result.path.lastIndex
 
                     Row(modifier = Modifier.fillMaxWidth()) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(32.dp)) {
-                            Surface(
-                                shape = CircleShape,
-                                color = if (isLast) Color(0xFFE53935) else Color(0xFF1565C0),
-                                modifier = Modifier.size(26.dp)
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.width(36.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .background(
+                                        when {
+                                            index == 0 -> Color(0xFF2E7D32)
+                                            isLast -> Color(0xFFC62828)
+                                            else -> Color(0xFF1565C0)
+                                        },
+                                        shape = CircleShape
+                                    ),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Text("${index + 1}", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                }
+                                Text(
+                                    "${index + 1}",
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                             if (!isLast) {
                                 Box(
                                     modifier = Modifier
-                                        .width(2.dp)
-                                        .height(34.dp)
-                                        .background(Color(0xFFBBDEFB))
+                                        .width(3.dp)
+                                        .height(40.dp)
+                                        .background(Color(0xFF90CAF9))
                                 )
                             }
                         }
+
                         Spacer(Modifier.width(10.dp))
+
                         Card(
-                            modifier = Modifier.fillMaxWidth().padding(bottom = if (isLast) 0.dp else 4.dp),
-                            shape = RoundedCornerShape(10.dp),
-                            elevation = CardDefaults.cardElevation(2.dp),
-                            onClick = {
-                                if (node?.isBuilding == true) {
-                                    navController.navigate("building/$nodeId")
-                                }
-                            }
+                            modifier = Modifier.weight(1f).padding(bottom = 8.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            elevation = CardDefaults.cardElevation(2.dp)
                         ) {
-                            Column(modifier = Modifier.padding(10.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        if (node?.isBuilding == true) Icons.Default.Business else Icons.Default.Place,
-                                        null,
-                                        tint = Color(0xFF1565C0),
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(node?.name ?: nodeId, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
-                                    if (node?.isBuilding == true) {
-                                        Text(if (node.hasRamp) "♿" else "🪜", fontSize = 14.sp)
-                                    }
-                                }
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(
+                                    text = node?.name ?: nodeId,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp
+                                )
                                 if (edge != null) {
+                                    val segDist = "${edge.distance.toInt()}m"
+                                    val surf = edge.surface.name.lowercase().replaceFirstChar { it.uppercase() }
                                     Text(
-                                        "Walk ${edge.distance.toInt()}m · ${edge.surface.name.lowercase()}" +
-                                                if (edge.hasStairs) " (⚠️ has stairs)" else " (barrier-free)",
-                                        fontSize = 11.sp,
-                                        color = Color.Gray,
-                                        modifier = Modifier.padding(top = 2.dp, start = 22.dp)
+                                        text = "Walk $segDist → ($surf surface${if (edge.hasStairs) ", ⚠️ Stairs" else ", ♿ Flat/Ramp"})",
+                                        fontSize = 12.sp,
+                                        color = Color.Gray
                                     )
+                                } else if (isLast) {
+                                    Text("🎉 Destination Reached", fontSize = 12.sp, color = Color(0xFF2E7D32), fontWeight = FontWeight.Medium)
                                 }
                             }
                         }
                     }
                 }
-
-                item { Spacer(Modifier.height(16.dp)) }
             }
         }
     }
@@ -411,9 +507,8 @@ fun NavigationScreen(
 @Composable
 fun RouteStatBadge(emoji: String, value: String, label: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(emoji, fontSize = 22.sp)
-        Text(value, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF1565C0))
+        Text(emoji, fontSize = 20.sp)
+        Text(value, fontWeight = FontWeight.Bold, fontSize = 15.sp, color = MaterialTheme.colorScheme.primary)
         Text(label, fontSize = 11.sp, color = Color.Gray)
     }
 }
-
