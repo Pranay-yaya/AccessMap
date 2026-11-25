@@ -3,9 +3,12 @@ package com.accessmap.app.routing
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationManager
+import android.net.Uri
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 
 sealed class GpsOriginResult {
@@ -72,5 +75,15 @@ object CampusLocationHelper {
         } else {
             GpsOriginResult.OutsideCampus(nearest, dist)
         }
+    }
+
+    fun openAppPermissionSettings(context: Context) {
+        val intent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.fromParts("package", context.packageName, null)
+        ).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
     }
 }

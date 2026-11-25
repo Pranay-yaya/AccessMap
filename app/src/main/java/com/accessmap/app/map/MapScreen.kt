@@ -121,7 +121,7 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
             followUser = true
             locationNotice = "📡 Live GPS enabled — waiting for satellite lock..."
         } else {
-            locationNotice = "⚠️ Location permission denied. Map works without live GPS dot."
+            locationNotice = "⚠️ Location permission denied. Tap here to open App Settings and allow Location."
         }
     }
 
@@ -380,7 +380,12 @@ fun MapScreen(navController: NavHostController, fromId: String, toId: String) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 12.dp, vertical = 6.dp)
-                        .clickable { locationNotice = null }
+                        .clickable {
+                            if (msg.contains("App Settings")) {
+                                CampusLocationHelper.openAppPermissionSettings(context)
+                            }
+                            locationNotice = null
+                        }
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
