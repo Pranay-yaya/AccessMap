@@ -1,4 +1,4 @@
-# AccessMap (P12) — Starter Scaffold
+# AccessMap 
 
 This is a Phase 1 skeleton matching the architecture in your notes: a running
 map screen, the accessibility-weighted routing engine, and the Room layer for
